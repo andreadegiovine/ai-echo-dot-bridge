@@ -8,6 +8,8 @@ from wyoming.tts import Synthesize
 
 LOG = open(sys.argv[1], "a", buffering=1)
 SLOW = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0      # secondi prima della prima parola dell'agente
+MODE = sys.argv[3] if len(sys.argv) > 3 else ""             # "followup": solo la prima risposta finisce con una domanda
+CALLS = [0]
 
 
 class Stt(AsyncEventHandler):
@@ -44,8 +46,11 @@ async def llm(reader, writer):
     LOG.write(f"llm: messages={json.dumps(body['messages'], ensure_ascii=False)} stream={body['stream']}\n")
     writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n")
     await asyncio.sleep(SLOW)
-    for piece in ["<think>devo usare lo strumento meteo</think>", "Domani a Roma ", "**sole** e 22 gradi. ",
-                  "Ti serve", " altro?"]:
+    CALLS[0] += 1
+    pieces = ["<think>devo usare lo strumento meteo</think>", "Domani a Roma ", "**sole** e 22 gradi. ", "Ti serve", " altro?"]
+    if MODE == "followup" and CALLS[0] > 1:
+        pieces = ["Va bene, ", "a dopo."]
+    for piece in pieces:
         writer.write(f"data: {json.dumps({'choices': [{'delta': {'content': piece}}]})}\n\n".encode())
         await writer.drain(); await asyncio.sleep(0.05)
     writer.write(b"data: [DONE]\n\n"); await writer.drain(); writer.close()

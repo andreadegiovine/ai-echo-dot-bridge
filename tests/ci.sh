@@ -13,7 +13,7 @@ check() {   # check <descrizione> <output> <regex> [conteggio minimo]
 refute() {
     if grep -E -q -- "$3" <<<"$2"; then echo "FAIL $1 (trovato '$3')"; FAIL=1; else echo "ok   $1"; fi
 }
-run() { timeout 150 bash "$HERE/run_test.sh" "$HOST_BIN" "$VENV" "$@" 2>&1; pkill -9 -f "hassmic-host -P wyoming|fakes.py .*fakes.log|python3 .*echo_bridge.py" 2>/dev/null; true; }
+run() { timeout 150 bash "$HERE/run_test.sh" "$HOST_BIN" "$VENV" "$@" 2>&1; pkill -9 -f "hassmic-host -P wyoming|fakes.py .*fakes.log|python3 -m echobridge" 2>/dev/null; true; }
 peak() { sed -n 's/.*picco \([0-9]*\).*/\1/p' <<<"$1"; }
 
 echo "== 1. voce sintetica, due richieste"

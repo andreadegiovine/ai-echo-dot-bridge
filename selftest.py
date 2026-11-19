@@ -5,7 +5,7 @@ import asyncio, os, sys, time
 
 sys.path.insert(0, os.environ.get("BRIDGE_DIR", "/opt/echo-bridge"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import echo_bridge as b
+from echobridge import config as cfg, speech as b
 
 PHRASE = "Accendi la luce del soggiorno, per favore."
 

@@ -17,11 +17,13 @@ echo "==> Utente di servizio"
 id echobridge >/dev/null 2>&1 || useradd --system --home-dir $APP --shell /usr/sbin/nologin echobridge
 
 echo "==> Ambiente Python"
-mkdir -p $APP /var/lib/echo-bridge/{whisper,piper} /etc/echo-bridge
+mkdir -p $APP /var/lib/echo-bridge/{whisper,piper,state} /etc/echo-bridge
 python3 -m venv $APP/venv
 $APP/venv/bin/pip install --upgrade pip
 $APP/venv/bin/pip install -r requirements.txt
-install -m 755 echo_bridge.py selftest.py $APP/
+rm -rf $APP/echobridge $APP/echo_bridge.py
+cp -r echobridge $APP/
+install -m 755 selftest.py $APP/
 [ -f /etc/echo-bridge/echo-bridge.env ] || install -m 640 echo-bridge.env /etc/echo-bridge/echo-bridge.env
 chown -R echobridge:echobridge $APP /var/lib/echo-bridge
 chgrp echobridge /etc/echo-bridge/echo-bridge.env
@@ -64,14 +66,15 @@ EOF
 
 cat > /etc/systemd/system/echo-bridge.service <<EOF
 [Unit]
-Description=Echo Dot (hassmic, Wyoming) <-> agente locale
+Description=Echo Dot (hassmic) <-> agente locale
 After=network-online.target wyoming-whisper.service wyoming-piper.service
 Wants=network-online.target wyoming-whisper.service wyoming-piper.service
 
 [Service]
 User=echobridge
 EnvironmentFile=/etc/echo-bridge/echo-bridge.env
-ExecStart=$APP/venv/bin/python $APP/echo_bridge.py
+WorkingDirectory=$APP
+ExecStart=$APP/venv/bin/python -m echobridge
 Restart=always
 RestartSec=5
 
@@ -88,6 +91,6 @@ for port in 10300 10200; do
 done
 echo
 echo "Fatto. Ora:"
-echo "  1. nano /etc/echo-bridge/echo-bridge.env   (ECHO_HOSTS e LLM_URL)"
+echo "  1. nano /etc/echo-bridge/echo-bridge.env   (ECHO_HOSTS e LLM_URL; per i nuovi parametri confronta con echo-bridge.env del repository)"
 echo "  2. systemctl enable --now echo-bridge"
 echo "  3. journalctl -fu echo-bridge"

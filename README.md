@@ -4,13 +4,15 @@
 
 **Echo Dot 3 → altoparlante del tuo agente locale, senza cloud e senza Home Assistant.**
 
-L'Echo viene sbloccato con [echo-dot-assist (hassmic)](https://github.com/Gamer92000/echo-dot-assist) e messo in
-modalità Wyoming. Questo repository contiene il bridge che lo collega a faster-whisper, Piper e al tuo agente
-(llama.cpp + server MCP), tutto in un container LXC su Proxmox.
+L'Echo viene sbloccato con [echo-dot-assist (hassmic)](https://github.com/Gamer92000/echo-dot-assist). Questo
+repository contiene il bridge che prende il posto di Home Assistant: parla con l'Echo con lo stesso protocollo
+(ESPHome) e lo collega a faster-whisper, Piper e al tuo agente (llama.cpp + server MCP), tutto in un container LXC
+su Proxmox. Così restano tutte le funzioni native di hassmic (timer, annunci, domande di seguito, sussurro, più Echo
+che non rispondono tutti insieme), e il bridge le offre all'agente come strumenti MCP.
 
 | File | Cosa contiene |
 |---|---|
-| [`echo_bridge.py`](echo_bridge.py) | il bridge Echo ↔ STT ↔ agente ↔ TTS |
+| [`echobridge/`](echobridge) | il bridge: [ESPHome](echobridge/esphome_echo.py) (default) e [Wyoming](echobridge/wyoming_echo.py), [voce e agente](echobridge/speech.py), [timer](echobridge/timers.py), [server HTTP e MCP](echobridge/server.py) |
 | [`install.sh`](install.sh) | installazione nel container: librerie, utente e servizi systemd |
 | [`echo-bridge.env`](echo-bridge.env) | configurazione di esempio (finisce in `/etc/echo-bridge/`) |
 | [`selftest.py`](selftest.py) | autotest di STT, TTS e agente, senza Echo |
@@ -19,28 +21,34 @@ modalità Wyoming. Questo repository contiene il bridge che lo collega a faster-
 ## Come funziona
 
 ```
- Echo Dot 3 sbloccato (hassmic, PROTO=wyoming)          LXC "echo-bridge" su Proxmox
- ┌──────────────────────────────────────────┐         ┌──────────────────────────────────────┐
- │ wake word "Alexa" (motore Amazon, locale)│  TCP    │ echo_bridge.py                       │
- │ microfoni + cancellazione eco Amazon     │ 16700   │  ├─ VAD (fine frase)                 │
- │ tasti, mute hardware, anello LED         │◀───────▶│  ├─ faster-whisper :10300 (STT, it)  │
- │ altoparlante                             │         │  ├─ agente / llama.cpp (API OpenAI)  │──▶ LXC llama.cpp
- │ firewall: solo rete locale, mai Amazon   │         │  └─ Piper :10200 (TTS, it)           │
- └──────────────────────────────────────────┘         └──────────────────────────────────────┘
+ Echo Dot 3 sbloccato (hassmic, ESPHome)                  LXC "echo-bridge" su Proxmox
+ ┌──────────────────────────────────────────┐  ESPHome   ┌────────────────────────────────────────┐
+ │ wake word "Alexa" (motore Amazon, locale)│  cifrato   │ echobridge (fa la parte di Home Ass.)  │
+ │ microfoni + cancellazione eco Amazon     │  :26053    │  ├─ VAD (fine frase)                   │
+ │ tasti, mute hardware, anello LED         │◀──────────▶│  ├─ faster-whisper :10300 (STT, it)    │
+ │ timer, annunci, sussurro (modello Amazon)│            │  ├─ agente (API OpenAI) ───────────────┼──▶ llama.cpp
+ │ arbitraggio tra più Echo, Drop In        │  HTTP      │  ├─ Piper :10200 (TTS, it)             │
+ │ firewall: solo rete locale, mai Amazon   │──────────▶ │  └─ :8124 audio delle risposte, MCP ◀──┼─── agente (strumenti)
+ └──────────────────────────────────────────┘  :8124     └────────────────────────────────────────┘
 ```
 
 - **Sull'Echo** restano solo le parti che Amazon fa bene: wake word "Alexa", cancellazione dell'eco, tasti e LED.
   Il client Alexa è spento e un firewall impedisce qualsiasi contatto con Amazon.
-- **Il container** collega l'Echo e fa tutto il resto: capisce quando hai finito di parlare, trascrive, chiede
-  all'agente e legge la risposta. Le frasi vengono lette man mano che l'agente le scrive.
+- **Il container** fa quello che farebbe Home Assistant: capisce quando hai finito di parlare, trascrive, chiede
+  all'agente e gli fa leggere la risposta. Le frasi vengono lette man mano che l'agente le scrive. In più tiene i timer,
+  fa gli annunci, imposta la cifratura e l'ora e passa le chiavi tra più Echo.
+- **L'agente** può comandare gli Echo con gli strumenti MCP del bridge: timer, annunci, volume, impostazioni, Drop In.
 - **Nessun passthrough hardware:** l'Echo è in Wi-Fi e il container ci parla via rete. Basta un container non
   privilegiato.
 
 Il bridge è provato end-to-end contro il simulatore di hassmic (`build/hassmic-host` del progetto upstream),
 con STT, TTS e agente finti. La [CI](https://github.com/andreadegiovine/ai-echo-dot-bridge/actions/workflows/ci.yml)
-ripete il test a ogni push. Il test ha coperto wake word, fine frase, trascrizione, risposta in streaming,
-agente lento oltre i 30 s, sussurro con risposta attenuata, tasto azione e "non hai detto niente". **Non è stato provato su un Echo
-vero, né con Whisper e Piper veri**: la prima prova reale sarà la tua.
+ripete i test a ogni push. In modalità ESPHome coprono: cifratura impostata dal bridge e riusata dopo un riavvio, ora
+data all'Echo, wake word, fine frase, risposta in streaming, domanda di seguito senza "Alexa", sussurro dal sensore
+nativo dell'Echo, timer (avvio, pausa, annullo, suoneria), annunci, volume, "non disturbare", tasti come eventi e
+webhook, due Echo che entrano nella stessa rete di arbitraggio, agente lento oltre i 30 s, tutto attraverso gli
+strumenti MCP. In modalità Wyoming: voce, sussurro stimato, agente lento. **Non è stato provato su un Echo vero, né
+con Whisper e Piper veri**: la prima prova reale sarà la tua.
 
 ---
 
@@ -117,12 +125,14 @@ Lo script:
 
 | Libreria | A cosa serve |
 |---|---|
-| `wyoming` 1.11.0 | protocollo per parlare con l'Echo, Whisper e Piper |
+| `wyoming` 1.11.0 | protocollo per parlare con Whisper e Piper (e con l'Echo in modalità Wyoming) |
 | `wyoming-faster-whisper` 3.9.1 | server STT (faster-whisper / CTranslate2) |
 | `wyoming-piper` 2.5.4 | server TTS (Piper) |
 | `webrtcvad-wheels` 2.0.14 | rileva quando hai smesso di parlare |
 | `httpx` 0.28.1 | chiamate in streaming all'agente |
 | `numpy` 2.5.5 | riconoscimento del sussurro e attenuazione dell'audio |
+| `aioesphomeapi` 46.25.0 | protocollo ESPHome: la libreria di Home Assistant, la stessa versione dei test di hassmic |
+| `mcp` 2.3.0, `uvicorn`, `starlette` | server HTTP del bridge: audio per l'Echo e strumenti MCP per l'agente |
 
 ### A4. Collega l'agente
 
@@ -143,11 +153,15 @@ nano /etc/echo-bridge/echo-bridge.env
   - **llama.cpp diretto**: `http://<ip-llama>:8080/v1/chat/completions`. Il modello risponde, ma **senza strumenti**.
   - **Il tuo agente con gli strumenti** (Home Assistant e il resto): metti qui il suo endpoint se espone
     `/v1/chat/completions` in streaming SSE. Se ha un'API diversa, basta riscrivere la funzione `ask_agent()` in
-    [`echo_bridge.py`](echo_bridge.py): deve restituire il testo a pezzi. Tutto il resto non cambia.
+    [`echobridge/speech.py`](echobridge/speech.py): deve restituire il testo a pezzi. Tutto il resto non cambia.
 - `LLM_EXTRA_JSON`: per i modelli "thinking" (Qwen3 e simili) conviene disattivare il ragionamento, altrimenti
   l'Echo resta in silenzio a lungo. Il bridge comunque scarta `<think>…</think>` e `reasoning_content`.
 - Prompt di sistema, contesto e strumenti li gestisce llama.cpp: il bridge manda solo la domanda trascritta, come
-  unico messaggio `user`. Dalla risposta toglie comunque `<think>`, `*`, `#`, URL ed emoji, perché viene letta ad alta voce.
+  unico messaggio `user`, e nel campo `user` della richiesta il nome dell'Echo che ha chiesto. Dalla risposta toglie
+  comunque `<think>`, `*`, `#`, URL ed emoji, perché viene letta ad alta voce.
+- **Unica eccezione, le domande di seguito:** se la risposta finisce con "?" l'Echo riascolta senza "Alexa", e nella
+  richiesta successiva il bridge mette anche la domanda e la risposta di prima, altrimenti un "sì" non avrebbe senso.
+  Per non mandarle: `FOLLOWUP_CONTEXT=0`. Per non riascoltare affatto: `FOLLOWUP=0`.
 
 ### A5. Autotest del container (ancora senza Echo)
 
@@ -165,6 +179,33 @@ LLM  ok: 'Tutto funziona.' (prima frase dopo 0.8 s, totale 0.9 s)
 ```
 
 Se tutte e tre le righe vanno, la parte server è pronta. **Non avviare ancora `echo-bridge`**: manca l'Echo.
+
+### A6. Dai all'agente gli strumenti degli Echo (MCP)
+
+Il bridge è anche un server MCP, all'indirizzo `http://<ip-echo-bridge>:8124/mcp` (streamable HTTP). Aggiungilo ai
+server MCP del tuo agente accanto a quello che già usi. Se imposti `API_TOKEN` in `echo-bridge.env`, l'agente deve
+mandare `Authorization: Bearer <token>`.
+
+| Strumento | Cosa fa |
+|---|---|
+| `set_timer`, `list_timers`, `cancel_timer`, `pause_timer`, `change_timer` | timer sull'Echo: l'anello mostra il tempo, alla fine suona finché non lo fermi ("Alexa, stop" o tasto) |
+| `announce` | fa dire un testo a un Echo; con `listen=true` poi ascolta la risposta e la passa all'agente |
+| `set_volume`, `media` | volume; riproduzione di un URL audio della rete locale, pausa, stop |
+| `echo_status`, `set_entity` | tutte le impostazioni e i sensori dell'Echo: non disturbare, suoni, luce dell'anello, equalizzatore, wake word, aggiornamenti… |
+| `run_action` | azioni dell'Echo, per esempio `drop_in` con `{"target": "Echo Cucina"}` per chiamare un altro Echo |
+| `list_echos` | Echo collegati, volume e timer in corso |
+
+Senza il parametro `echo` gli strumenti agiscono sull'Echo che ha ricevuto l'ultima richiesta, cioè quello da cui ti
+sta parlando chi ha chiesto "metti un timer di 10 minuti". Con più Echo l'agente può nominarli, per esempio
+`echo: "Echo Cucina"`.
+
+C'è anche una piccola API REST, utile per automazioni e script:
+
+```bash
+curl -X POST http://<ip-echo-bridge>:8124/api/announce -H 'Content-Type: application/json' \
+     -d '{"text": "La lavatrice ha finito", "echo": "Echo Cucina"}'
+curl http://<ip-echo-bridge>:8124/api/echos
+```
 
 ---
 
@@ -271,33 +312,37 @@ scripts/install-system.sh                      # installa e riavvia
 ```
 </details>
 
-### B4. Passa l'Echo in modalità Wyoming (senza Home Assistant)
+### B4. Modalità ESPHome: non c'è niente da cambiare
 
-Di default hassmic parla ESPHome per Home Assistant. Il bridge usa invece il protocollo **Wyoming** (porta 16700).
-Con il **cavo USB ancora collegato**:
+hassmic parla ESPHome di default (porta 26053), ed è proprio quello che usa il bridge. Al primo collegamento il bridge
+genera la chiave di cifratura e la imposta sull'Echo, come farebbe Home Assistant. Da lì in poi entra solo lui.
+
+- **Se l'Echo era già in Home Assistant**, ha la chiave di Home Assistant e il bridge non può entrare (nel log:
+  `l'Echo ha già una chiave che il bridge non conosce`). Elimina il dispositivo in Home Assistant, che cancella la
+  chiave, oppure con il cavo: `adb shell rm /data/local/hassmic/state/api_key` e riavvia l'Echo.
+- **Non collegare insieme** Home Assistant e il bridge allo stesso Echo: l'assistente vocale va a uno solo.
+- Opzione utile in `ARGS` di `/data/local/hassmic/hassmic.conf` (poi riavvia): `-E`, nessun suono quando senti "Alexa".
+- **Non** aggiungere `-w remote`: la wake word la riconosce l'Echo, ed è il motore originale di Amazon.
+
+<details>
+<summary>In alternativa: modalità Wyoming (meno funzioni)</summary>
+
+Wyoming è un protocollo più semplice: restano voce, tasti, anello e sussurro stimato dal bridge. Mancano cifratura,
+timer, annunci, domande di seguito, sussurro nativo, arbitraggio, Drop In e strumenti MCP. Si attiva con il cavo:
 
 ```bash
-adb shell cat /data/local/hassmic/hassmic.conf          # c'è solo ARGS=""
 adb shell 'echo PROTO=wyoming >> /data/local/hassmic/hassmic.conf'
 adb reboot
-# dopo circa un minuto:
-adb shell 'tail -n 30 /data/local/hassmic/boot.log' | grep -i wyoming
-#   ... hassmic ... wyoming on 16700, wake=local
 ```
 
-`wake=local` è fondamentale: significa che "Alexa" è riconosciuta dall'Echo. **Non** aggiungere `-w remote` agli ARGS:
-il bridge non fa da server per la wake word.
-
-Opzioni utili in `ARGS` (modifica il file e riavvia):
-
-- `-E`: nessun suono quando senti "Alexa".
-- `-a 0 -i 0`: niente arbitraggio né Drop In tra più Echo (in Wyoming non servono).
+e nel bridge `ECHO_HOSTS=wyoming://<ip-echo>` (porta 16700).
+</details>
 
 ### B5. Prima di staccare i fili
 
 - **Fai il backup di `secrets/update.key`.** Firma gli aggiornamenti di hassmic ed è l'unico modo di avere adb via
   Wi-Fi senza Home Assistant (`scripts/adb-wifi.sh <ip-echo>`, aperto 30 minuti).
-- Controlla dal container che la porta sia aperta: `nc -zv <ip-echo> 16700`.
+- Controlla dal container che la porta sia aperta: `nc -zv <ip-echo> 26053`.
 - Solo dopo dissalda, richiudi e riavvia.
 
 ---
@@ -311,17 +356,44 @@ systemctl enable --now echo-bridge
 journalctl -fu echo-bridge
 ```
 
-Di' **"Alexa, che ore sono?"**. Nel log dovresti vedere:
+Al primo avvio il bridge imposta la chiave e si collega. Di' **"Alexa, che ore sono?"**. Nel log dovresti vedere:
 
 ```
-INFO 192.168.1.50: collegato
-INFO 192.168.1.50: richiesta (wake word: alexa)
-INFO 192.168.1.50: hai detto: 'che ore sono?'
-INFO HTTP Request: POST http://.../v1/chat/completions "HTTP/1.1 200 OK"
-INFO 192.168.1.50: risposta: Sono le 21 e 15.
+INFO 192.168.1.50:26053: chiave di cifratura impostata e salvata
+INFO 192.168.1.50:26053: collegato a "Echo Dot 3 5695c4" (…, cifrato: sì, … entità)
+INFO server HTTP su 0.0.0.0:8124 (audio, MCP su /mcp, API su /api)
+INFO Echo Dot 3 5695c4: richiesta (Alexa)
+INFO Echo Dot 3 5695c4: hai detto: 'che ore sono?'
+INFO Echo Dot 3 5695c4: risposta: Sono le 21 e 15.
+INFO Echo Dot 3 5695c4: fine risposta (1 frasi)
 ```
 
-Con più Echo: `ECHO_HOSTS=192.168.1.50,192.168.1.51`.
+- **L'Echo deve raggiungere il container sulla porta 8124**: scarica da lì le risposte. Il firewall dell'Echo lascia
+  passare tutta la rete locale, quindi basta che il container non lo blocchi.
+- **Più Echo:** `ECHO_HOSTS=192.168.1.50,192.168.1.51`. Si accordano da soli su chi risponde (vedi sotto).
+- Le chiavi stanno in `/var/lib/echo-bridge/state/keys/`. **Fanne un backup:** senza, il bridge non rientra e devi
+  cancellare la chiave sull'Echo con il cavo o con `scripts/adb-wifi.sh`.
+
+### Le funzioni native, senza Home Assistant
+
+| Funzione | Come funziona con il bridge |
+|---|---|
+| **Cifratura** | chiave generata dal bridge al primo collegamento, come fa Home Assistant |
+| **Ora e fuso orario** | il bridge li dà all'Echo (`TIMEZONE`, ed eventualmente `HOME_LATITUDE`/`HOME_LONGITUDE`) |
+| **Risposte in streaming** | l'Echo scarica la risposta dal bridge e la suona mentre l'agente scrive ancora |
+| **Domande di seguito** | se la risposta finisce con "?", l'Echo riascolta da solo, senza "Alexa" |
+| **Sussurro** | il sensore dell'Echo con il modello originale di Amazon, se è installato; altrimenti la stima del bridge |
+| **Timer** | li chiede l'agente con `set_timer`; l'anello mostra il tempo, alla fine suona; "Alexa, stop" o il tasto lo fermano |
+| **Annunci** | `announce` (MCP) o `POST /api/announce`; con `listen=true` l'Echo poi ascolta la risposta |
+| **Più Echo: risponde solo il più vicino** | gli Echo si scambiano la chiave della loro rete attraverso il bridge, come attraverso Home Assistant |
+| **Drop In** tra Echo | `run_action` con `drop_in`; la chiamata va da Echo a Echo |
+| **Impostazioni e sensori** | `echo_status` e `set_entity`: non disturbare, suoni, luce dell'anello, equalizzatore, wake word, aggiornamenti |
+| **Tasti, wake word, Drop In come eventi** | nel log del bridge e, con `EVENT_WEBHOOK`, inoltrati come POST JSON |
+| **Annunci Bluetooth** ("Connesso a …") | l'Echo li chiede e il bridge li pronuncia |
+| **Aggiornamenti di hassmic** | canale scelto nella pagina impostazioni dell'Echo; installazione con `set_entity` sull'entità di aggiornamento |
+
+Restano fuori il proxy Bluetooth (serve solo a Home Assistant) e l'abbinamento automatico con Music Assistant, che
+passa da Home Assistant 2026.11: Music Assistant si abbina comunque a mano con il token dell'Echo.
 
 ### Tasti e anello, una volta in funzione
 
@@ -344,35 +416,41 @@ default). Il volume impostato sull'Echo non cambia. Nel log compare:
 INFO 192.168.1.50: hai detto: 'spegni la luce' (sussurrato, parlato con tono 3%: risposta a -12 dB)
 ```
 
-- **Come lo riconosce:** misura quanta parte del parlato ha un tono, cioè quanto vibrano le corde vocali. Nel sussurro
-  non vibrano. Non usa il volume, perché l'Echo alza da solo il guadagno di chi parla piano.
+- **Chi decide, in modalità ESPHome:** il sensore "Last request whispered" dell'Echo, con il modello originale di
+  Amazon. Nel log: `sussurrato, sensore dell'Echo`. Il modello si scarica una volta da Amazon dalla pagina impostazioni
+  dell'Echo ("Download from Amazon"): vedi la [guida del progetto](https://github.com/Gamer92000/echo-dot-assist/blob/main/docs/GUIDE.md#whisper-detection).
+  Senza quel modello, e in modalità Wyoming, decide la stima del bridge.
+- **La stima del bridge:** misura quanta parte del parlato ha un tono, cioè quanto vibrano le corde vocali. Nel
+  sussurro non vibrano. Non usa il volume, perché l'Echo alza da solo il guadagno di chi parla piano.
 - **Provato su voce sintetica:** con espeak-ng la voce normale ha il 58–78% di parlato con tono, il sussurro lo 0–6%.
   La soglia è al 20% (`WHISPER_RATIO`). Su voci vere potresti doverla ritoccare guardando il valore nel log.
-- **Non è il sussurro di Amazon:** il modello originale si scarica solo da Amazon e in modalità Wyoming non arriva al
-  bridge. Piper non sa sussurrare, quindi la risposta è la stessa voce a volume più basso.
+- **La risposta non è sussurrata:** Piper non sa sussurrare, quindi è la stessa voce a volume più basso.
 - **Wake word nella richiesta:** se attivi "Wake word in the request" nella pagina impostazioni di hassmic, anche
   "Alexa" detto a voce normale entra nel calcolo e un sussurro potrebbe non essere riconosciuto. Di default è spento.
 
 ---
 
-## Limiti noti (modalità Wyoming)
+## Limiti noti
 
 - **Limite di 30 s di hassmic:** l'Echo abbandona una richiesta dopo 30 s in "pensando". Se l'agente non ha ancora
-  detto la prima frase dopo `KEEPALIVE_S` (20 s), il bridge manda silenzio e l'anello passa a "parla". Nel test un
-  agente da 35 s ha risposto regolarmente.
-- **Tasto azione mentre l'agente sta ancora elaborando:** l'audio si ferma subito, ma il nuovo ascolto parte solo quando
-  l'agente ha finito la risposta in corso. Con risposte normali non te ne accorgi.
-- **Mancano rispetto a ESPHome:** timer, annunci, domande di seguito senza ridire "Alexa", Drop In, "risponde solo
-  l'Echo più vicino" (con più Echo nella stessa stanza rispondono tutti) e aggiornamenti online. Gli aggiornamenti di
-  hassmic si spingono dal PC con `scripts/ota-push.sh`.
-- **Collegamento in chiaro:** Wyoming è TCP non cifrato. Tieni Echo e container su una rete o VLAN fidata.
-- **Un solo client per Echo:** non collegare contemporaneamente Home Assistant e il bridge allo stesso Echo.
+  detto la prima frase dopo `KEEPALIVE_S` (20 s), il bridge comincia a mandare silenzio e l'anello passa a "parla". Nei
+  test un agente da 35 s ha risposto regolarmente, in entrambe le modalità.
+- **Timer in memoria:** se il bridge si riavvia, i timer in corso si perdono.
+- **Un solo "Home Assistant" per Echo:** non collegare insieme Home Assistant e il bridge allo stesso Echo.
+- **Solo modalità Wyoming:** collegamento in chiaro, niente timer, annunci, domande di seguito, sussurro nativo,
+  arbitraggio, Drop In e strumenti MCP. Il tasto azione premuto mentre l'agente elabora ferma subito l'audio, ma il
+  nuovo ascolto parte solo quando l'agente ha finito.
+- **Aggiornamenti di hassmic in Wyoming:** solo dal PC con `scripts/ota-push.sh`. In ESPHome anche online, dall'entità
+  di aggiornamento.
 
 ## Se qualcosa non va
 
 | Sintomo | Dove guardare |
 |---|---|
-| `non raggiungibile` nel log del bridge | IP dell'Echo, `nc -zv <ip-echo> 16700`, `PROTO=wyoming` presente nel conf |
+| `non raggiungibile` nel log del bridge | IP dell'Echo, `nc -zv <ip-echo> 26053` (16700 in Wyoming) |
+| `l'Echo ha già una chiave che il bridge non conosce` | era in Home Assistant: vedi [B4](#b4-modalità-esphome-non-cè-niente-da-cambiare) |
+| Risponde ma non si sente niente | l'Echo deve raggiungere il container sulla porta 8124; con più schede di rete imposta `PUBLIC_HOST` |
+| L'agente non vede gli strumenti | indirizzo `http://<ip-echo-bridge>:8124/mcp` nel client MCP dell'agente, e `API_TOKEN` se impostato |
 | Si accende ma `non hai detto niente` | Volume della voce o `VAD_MODE=1`; aumenta `NO_SPEECH_S` |
 | Taglia la frase a metà | Aumenta `SILENCE_MS` (1000–1200) |
 | Trascrizioni sbagliate | `WHISPER_MODEL=medium-int8` (rilancia `install.sh` oppure modifica `/etc/systemd/system/wyoming-whisper.service`) |
@@ -426,7 +504,7 @@ senza password aperta a tutta la rete locale: va bene per una prova, non per sem
    ```bash
    adb connect <ip-echo>:5555
    adb shell "sed -i '/^MODE=/d;/^ADB_WIFI=/d' /data/local/hassmic/hassmic.conf"
-   adb shell cat /data/local/hassmic/hassmic.conf     # devono restare ARGS e PROTO=wyoming
+   adb shell cat /data/local/hassmic/hassmic.conf     # deve restare la riga ARGS (e PROTO=wyoming se lo usavi)
    adb reboot
    ```
 3. Blocca di nuovo l'uscita su internet dal router e riavvia il bridge con `systemctl start echo-bridge`.
@@ -494,15 +572,19 @@ sudo apt-get install -y build-essential libopus-dev zlib1g-dev espeak-ng python3
 git clone https://github.com/Gamer92000/echo-dot-assist.git /tmp/echo-dot-assist
 make -C /tmp/echo-dot-assist build/hassmic-host
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-bash tests/ci.sh /tmp/echo-dot-assist/build/hassmic-host .venv
+bash tests/ci.sh /tmp/echo-dot-assist/build/hassmic-host .venv            # modalità Wyoming
+espeak-ng -v it -w voce.wav "Alexa, accendi la luce del soggiorno e dimmi che tempo fa domani"
+.venv/bin/python tests/esphome_e2e.py /tmp/echo-dot-assist/build/hassmic-host voce.wav   # modalità ESPHome
 ```
 
 ## Crediti
 
 - [echo-dot-assist / hassmic](https://github.com/Gamer92000/echo-dot-assist) di Gamer92000: sblocco guidato, firmware
-  e protocollo Wyoming sull'Echo. Questo repository non contiene niente del loro codice e lo scarica solo per i test.
+  e protocolli ESPHome e Wyoming sull'Echo. Questo repository non contiene niente del loro codice e lo scarica solo per i test.
 - [R0rt1z2](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-3rd-gen-2018-donut.4801400/): exploit,
   TWRP e root dell'Echo Dot 3.
+- [aioesphomeapi](https://github.com/esphome/aioesphomeapi) (il protocollo ESPHome, dalla libreria di Home Assistant),
+  [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
 - [Wyoming](https://github.com/OHF-Voice/wyoming), [wyoming-faster-whisper](https://github.com/rhasspy/wyoming-faster-whisper),
   [wyoming-piper](https://github.com/rhasspy/wyoming-piper).
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test end-to-end: hassmic-host (Echo simulato, PROTO=wyoming) <-> echo_bridge.py <-> server finti.
+# Test end-to-end: hassmic-host (Echo simulato, PROTO=wyoming) <-> echobridge <-> server finti.
 # Uso: run_test.sh <percorso build/hassmic-host> <venv> [ritardo agente in s]
 set -u
 HOST_BIN=$1; VENV=$2; SLOW=${3:-0}
@@ -34,8 +34,8 @@ HASSMIC_CAP=$W/cap.raw HASSMIC_PLAY=$W/play.raw HASSMIC_FAKE_LED=$W/led HASSMIC_
   "$HOST_BIN" -P wyoming -p 16799 -n "Test Dot" 2> "$W/hassmic.log" & ECHO_PID=$!
 python3 "$HERE/fakes.py" "$W/fakes.log" "$SLOW" 2> "$W/fakes.err" & FAKES_PID=$!
 sleep 2
-ECHO_HOSTS=127.0.0.1:16799 LLM_URL=http://127.0.0.1:18080/v1/chat/completions KEEPALIVE_S=${KEEPALIVE_S:-20} \
-  python3 "$HERE/../echo_bridge.py" 2> "$W/bridge.log" & BRIDGE_PID=$!
+(cd "$HERE/.." && ECHO_HOSTS=wyoming://127.0.0.1:16799 LLM_URL=http://127.0.0.1:18080/v1/chat/completions KEEPALIVE_S=${KEEPALIVE_S:-20} \
+  exec python3 -m echobridge) 2> "$W/bridge.log" & BRIDGE_PID=$!
 sleep 2
 kill -USR1 $ECHO_PID                                     # "Alexa"
 sleep ${WAIT:-10}
