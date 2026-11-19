@@ -1,0 +1,7 @@
+# Versioni provate insieme (Python 3.13, Debian 13)
+wyoming==1.11.0
+wyoming-faster-whisper==3.9.1
+wyoming-piper==2.5.4
+webrtcvad-wheels==2.0.14.post1
+httpx==0.28.1
+numpy==2.5.5

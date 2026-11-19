@@ -1,0 +1,61 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Commit di echo-dot-assist (hassmic) con cui il bridge è provato. Aggiornalo per provare una versione nuova.
+  HASSMIC_REPO: https://github.com/Gamer92000/echo-dot-assist.git
+  HASSMIC_REF: d71209987fdacc152c49bb40fbc0c83c9ee03c7e
+
+jobs:
+  e2e:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Pacchetti di sistema
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential libopus-dev zlib1g-dev espeak-ng
+
+      - name: Cache del simulatore hassmic
+        id: cache-hassmic
+        uses: actions/cache@v4
+        with:
+          path: hassmic-host
+          key: hassmic-host-${{ env.HASSMIC_REF }}-ubuntu-24.04
+
+      - name: Compila il simulatore hassmic (build/hassmic-host)
+        if: steps.cache-hassmic.outputs.cache-hit != 'true'
+        run: |
+          git init upstream && cd upstream
+          git remote add origin "$HASSMIC_REPO"
+          git fetch --depth 1 origin "$HASSMIC_REF"
+          git checkout --quiet FETCH_HEAD
+          make -j"$(nproc)" build/hassmic-host
+          cp build/hassmic-host ../hassmic-host
+
+      - name: Ambiente Python
+        run: |
+          python -m venv .venv
+          .venv/bin/pip install --upgrade pip
+          .venv/bin/pip install -r requirements.txt
+
+      - name: Controllo sintassi
+        run: |
+          .venv/bin/python -m py_compile echo_bridge.py selftest.py tests/fakes.py
+          bash -n install.sh tests/run_test.sh tests/ci.sh
+
+      - name: Test end-to-end
+        run: bash tests/ci.sh "$PWD/hassmic-host" "$PWD/.venv"
