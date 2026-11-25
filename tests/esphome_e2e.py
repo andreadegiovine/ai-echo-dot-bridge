@@ -166,7 +166,7 @@ async def phase_a():
         check({"do_not_disturb", "mute", "wake_sound"} <= ids, f"MCP echo_status: {len(ids)} entità, azioni {st.get('actions')}")
 
         t = await mcp_call(s.http_port, "set_timer", {"seconds": 3, "name": "tè"})
-        check(isinstance(t, dict) and t.get("name") == "tè", f"MCP set_timer: {t}")
+        check(isinstance(t, dict) and t["timers"][0]["name"] == "tè", f"MCP set_timer: {t}")
         check(await wait_for(lambda: "timer started: tè" in read(s.echo_log), 5), "l'Echo ha ricevuto il timer")
         lt = (await mcp_call(s.http_port, "list_timers"))["timers"]
         check(isinstance(lt, list) and len(lt) == 1, f"MCP list_timers: {lt}")
@@ -185,7 +185,7 @@ async def phase_a():
 
         before = os.path.getsize(s.play)
         r = await mcp_call(s.http_port, "announce", {"text": "La lavatrice ha finito."})
-        check("riprodotto" in str(r) and os.path.getsize(s.play) > before, f"MCP announce: {r}")
+        check(r.get("played") is True and os.path.getsize(s.play) > before, f"MCP announce: {r}")
         await mcp_call(s.http_port, "set_volume", {"level": 30})
         await asyncio.sleep(1)
         echos = (await mcp_call(s.http_port, "list_echos"))["echos"]
@@ -193,7 +193,7 @@ async def phase_a():
         await mcp_call(s.http_port, "set_entity", {"entity": "do_not_disturb", "value": "on"})
         await asyncio.sleep(0.5)
         r = await mcp_call(s.http_port, "announce", {"text": "Non dovresti sentirmi."})
-        check("non riprodotto" in str(r), f"non disturbare blocca gli annunci: {r}")
+        check(r.get("played") is False, f"non disturbare blocca gli annunci: {r}")
         await mcp_call(s.http_port, "set_entity", {"entity": "do_not_disturb", "value": "off"})
 
         s.key(115, 1); await asyncio.sleep(0.15); s.key(115, 0)          # Volume + premuto e rilasciato
@@ -447,6 +447,126 @@ async def phase_f():
         shutil.rmtree(s.dir, ignore_errors=True); shutil.rmtree(www, ignore_errors=True)
 
 
+async def phase_g():
+    print("== G. sveglie, promemoria, salvataggio su disco, notifiche, \"tutti\", sleep della musica, modalità notte")
+    import datetime as dtm, functools, http.server, json as js, threading, urllib.request
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo("Europe/Rome")
+    www = tempfile.mkdtemp()
+    subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "sine=frequency=330:duration=60",
+                    "-ac", "2", "-c:a", "libopus", "-b:a", "96k", os.path.join(www, "song.webm")], check=True)
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k): super().__init__(*a, directory=www, **k)
+        def log_message(self, *a): pass
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 18330), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    s = Setup(16979, 18194, False)
+    def api(path, body=None, method=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{s.http_port}{path}", data=js.dumps(body).encode() if body is not None else None,
+                                     headers={"Content-Type": "application/json"}, method=method)
+        try:
+            return js.loads(urllib.request.urlopen(req, timeout=90).read())
+        except urllib.error.HTTPError as e:
+            return {"http": e.code, **js.loads(e.read() or b"{}")}
+    blog, elog = (lambda: read(s.bridge_log)), (lambda: read(s.echo_log))
+    br = dict(FOLLOWUP="0", SENDSPIN="0")
+    def ent(oid):
+        st = api("/api/echos?entities=1")[0]
+        return next((e.get("state", {}).get("state") for e in st["entities"] if e["id"] == oid), None)
+    try:
+        s.start_fakes(); s.start_echo(); await asyncio.sleep(1.5); s.start_bridge(**br)
+        check(await wait_for(lambda: "collegato a" in blog()), "collegato")
+
+        # sveglia al prossimo minuto, giorno preciso
+        nxt = (dtm.datetime.now(TZ) + dtm.timedelta(minutes=1)).replace(second=0, microsecond=0)
+        r = api("/api/alarms", {"action": "set", "time": nxt.strftime("%H:%M"), "date": nxt.date().isoformat(), "name": "Sveglia test"})
+        check(r.get("alarms") and r["alarms"][0]["next"] == nxt.strftime("%Y-%m-%d %H:%M"), f"sveglia impostata: {r}")
+        r = api("/api/alarms", {"action": "set", "time": "07:00", "days": "feriali", "name": "Lavoro"})
+        nday = dtm.date.fromisoformat(r["alarms"][0]["next"][:10]) if r.get("alarms") else None
+        check(nday is not None and nday.weekday() < 5 and r["alarms"][0]["days"] == [0, 1, 2, 3, 4], f"sveglia ricorrente nei feriali: {r}")
+        check(api("/api/alarms", {"action": "set", "time": "25:00"}).get("http") == 400, "orario non valido: errore 400")
+
+        # promemoria in 3 s, e uno durante "non disturbare"
+        before = os.path.getsize(s.play)
+        r = api("/api/reminders", {"text": "chiamare Marco", "in_minutes": 0.05})
+        check(r.get("reminders"), f"promemoria impostato: {r}")
+        check(await wait_for(lambda: "promemoria detto: chiamare Marco" in blog(), 15) and os.path.getsize(s.play) > before,
+              "promemoria detto dall'Echo all'ora giusta")
+        check(api("/api/reminders?action=list")["reminders"] == [], "promemoria singolo: tolto dopo averlo detto")
+        await mcp_call(s.http_port, "set_entity", {"entity": "do_not_disturb", "value": "on"}); await asyncio.sleep(0.5)
+        await mcp_call(s.http_port, "set_reminder", {"text": "bere acqua", "in_minutes": 0.05})
+        await asyncio.sleep(6)
+        check("promemoria detto: bere acqua" not in blog(), "con \"non disturbare\" il promemoria aspetta")
+        await mcp_call(s.http_port, "set_entity", {"entity": "do_not_disturb", "value": "off"})
+        check(await wait_for(lambda: "promemoria detto: bere acqua" in blog(), 15), "finito \"non disturbare\", il promemoria viene detto")
+
+        # notifiche
+        r = api("/api/notify", {"text": "Il backup è finito", "source": "backup"})
+        check(len(r.get("notifications", [])) == 1, f"notifica lasciata: {r}")
+        check(api("/api/echos")[0]["notifications"] == 1, "l'Echo ha 1 notifica in attesa")
+        r = await mcp_call(s.http_port, "read_notifications")
+        check(r.get("notifications") and r["notifications"][0]["text"] == "Il backup è finito" and r.get("cleared"),
+              f"l'agente legge le notifiche: {r}")
+        check(api("/api/notify?action=list")["notifications"] == [], "lette: nessuna notifica in attesa")
+
+        # tutti
+        r = api("/api/announce", {"text": "La cena è pronta", "echo": "all"})
+        check(r.get("all") and r["results"][0]["played"] is True, f"annuncio a tutti: {r}")
+        r = api("/api/timers", {"action": "start", "seconds": 600, "name": "pasta", "echo": "tutti"})
+        check(r.get("all") and r["results"][0]["timers"][0]["name"] == "pasta", f"timer su tutti: {r}")
+
+        # sveglia al minuto (impostata all'inizio)
+        check(await wait_for(lambda: "timer finished: Sveglia test" in elog(), 75), "la sveglia suona all'ora impostata")
+        check(all(a["name"] != "Sveglia test" for a in api("/api/alarms?action=list")["alarms"]), "sveglia singola: tolta dopo aver suonato")
+
+        # salvataggio su disco: riavvio del bridge
+        api("/api/reminders", {"text": "riunione", "in_minutes": 120})
+        s.stop("bridge"); open(s.bridge_log, "w").close(); s.start_bridge(**br)
+        check(await wait_for(lambda: "collegato a" in blog()), "riavvio del bridge")
+        st = api("/api/echos")[0]
+        check([t["name"] for t in st["timers"]] == ["pasta"] and [a["name"] for a in st["alarms"]] == ["Lavoro"]
+              and [r["text"] for r in st["reminders"]] == ["riunione"], f"dopo il riavvio: timer, sveglie e promemoria ci sono ancora")
+        n = elog().count("timer started: pasta")
+        check(n >= 2, "il timer è di nuovo sull'Echo dopo il riavvio")
+        api("/api/timers", {"action": "start", "seconds": 3, "name": "breve"})
+        s.stop("bridge"); await asyncio.sleep(5); open(s.bridge_log, "w").close(); s.start_bridge(**br)
+        check(await wait_for(lambda: "timer finished: breve" in elog(), 20), "timer scaduto a bridge spento: suona appena torna")
+        api("/api/timers", {"action": "cancel", "all": True}); api("/api/alarms", {"action": "cancel", "all": True})
+        api("/api/reminders", {"action": "cancel", "all": True})
+
+        # sleep della musica (dal media player: SENDSPIN=0 qui)
+        await mcp_call(s.http_port, "set_volume", {"level": 60}); await asyncio.sleep(0.5)
+        api("/api/music", {"url": "http://127.0.0.1:18330/song.webm", "title": "Ninna nanna"})
+        await asyncio.sleep(2)
+        r = await mcp_call(s.http_port, "music_sleep", {"minutes": 0.1, "fade": 3})
+        check(r.get("sleep") and r["sleep"]["seconds_left"] <= 6, f"sleep impostato: {r.get('sleep')}")
+        check(await wait_for(lambda: "sleep: musica fermata" in blog(), 15), "allo scadere la musica si abbassa e si ferma")
+        check("sleep: la musica si abbassa" in blog(), "prima si abbassa piano")
+        await asyncio.sleep(1)
+        e0 = api("/api/echos")[0]
+        check(e0["music"]["state"] == "idle" and abs((e0.get("volume") or 0) - 0.6) < 0.02, f"musica ferma, volume di nuovo a 60: {e0.get('volume')}")
+
+        # modalità notte: fascia che contiene adesso
+        s.stop("bridge"); open(s.bridge_log, "w").close()
+        now = dtm.datetime.now(TZ)
+        s.start_bridge(**br, NIGHT_START=(now - dtm.timedelta(minutes=5)).strftime("%H:%M"),
+                       NIGHT_END=(now + dtm.timedelta(minutes=30)).strftime("%H:%M"), NIGHT_VOLUME="15")
+        check(await wait_for(lambda: "modalità notte attiva" in blog(), 15), "modalità notte attiva nella fascia")
+        await asyncio.sleep(1)
+        check(ent("do_not_disturb") is True and abs((api("/api/echos")[0].get("volume") or 0) - 0.15) < 0.02,
+              "di notte: non disturbare acceso e volume a 15")
+        r = api("/api/night", {"action": "off"})
+        check(r.get("mode") == "off" and await wait_for(lambda: "modalità notte finita" in blog(), 5), f"spenta a mano: {r}")
+        await asyncio.sleep(1)
+        check(ent("do_not_disturb") is False and abs((api("/api/echos")[0].get("volume") or 0) - 0.6) < 0.02,
+              "non disturbare spento e volume di nuovo a 60")
+    finally:
+        s.close(); httpd.shutdown()
+        if FAILED:
+            print("--- bridge.log ---\n" + read(s.bridge_log)[-4000:]); print("--- echo ---\n" + read(s.echo_log)[-3000:])
+        shutil.rmtree(s.dir, ignore_errors=True); shutil.rmtree(www, ignore_errors=True)
+
+
 async def main():
     if os.environ.get("ONLY"):
         await globals()["phase_" + os.environ["ONLY"]]()
@@ -458,6 +578,7 @@ async def main():
     await phase_d()
     await phase_e()
     await phase_f()
+    await phase_g()
     print("TUTTI I TEST ESPHOME OK" if not FAILED else f"FALLITI: {len(FAILED)}")
     sys.exit(1 if FAILED else 0)
 

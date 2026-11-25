@@ -24,7 +24,7 @@ from aioesphomeapi import VoiceAssistantEventType as Ev
 
 from . import audio, config as c, speech
 from .music import Music
-from .timers import Timers
+from .planner import Planner
 
 log = logging.getLogger("echo-bridge")
 
@@ -87,7 +87,7 @@ class EsphomeEcho:
         self.states: dict[int, object] = {}
         self.state_seq: dict[int, int] = {}
         self.state_subs: set[tuple[str, str | None]] = set()
-        self.timers = Timers(self._timer_event, self.label)
+        self.planner = Planner(self, hub.store)
         self.run_task = None
         self.listener = None
         self.followup = None                        # (domanda, risposta, quando) se l'ultima risposta era una domanda
@@ -143,6 +143,7 @@ class EsphomeEcho:
         return key
 
     async def serve_forever(self):
+        self.planner.start()
         while True:
             try:
                 await self._session()
@@ -193,7 +194,7 @@ class EsphomeEcho:
                 asyncio.get_running_loop().create_task(self.ss_music.setup())
             log.info("%s: collegato a \"%s\" (%s, cifrato: %s, %d entità)", self.label, self.name, self.info.model,
                      "sì" if key else "no", len(ents))
-            self.timers.resend_all()
+            self.planner.on_connect()
             await stopped.wait()
             log.warning("%s: collegamento chiuso", self.label)
         finally:
@@ -261,12 +262,6 @@ class EsphomeEcho:
                                    api.UserServiceArgType.INT: int, api.UserServiceArgType.FLOAT: float}.get(arg.type, str)(v)
         await self.cli.execute_service(svc, typed)
         return True
-
-    # ------------------------------------------------------------ timer
-
-    def _timer_event(self, kind, timer_id, name, total, left, active):
-        if self.cli:
-            self.cli.send_voice_assistant_timer_event(kind, timer_id, name, total, left, active)
 
     # ------------------------------------------------------------ pipeline vocale
 
@@ -465,6 +460,10 @@ class EsphomeEcho:
     def media_player(self):
         return next(e for e in self.entities.values() if isinstance(e, api.MediaPlayerInfo))
 
+    def volume(self):
+        mp = next((s for s in self.states.values() if isinstance(s, api.MediaPlayerEntityState)), None)
+        return round(mp.volume, 3) if mp is not None else None
+
     def set_volume(self, level: float):
         self.cli.media_player_command(self.media_player().key, volume=max(0.0, min(1.0, level)))
 
@@ -487,13 +486,15 @@ class EsphomeEcho:
         return self.music.status()
 
     def describe(self, entities=False):
+        p = self.planner
         d = {"name": self.name, "node": self.node, "protocol": self.proto, "address": self.label,
-             "connected": self.connected, "timers": self.timers.list()}
+             "connected": self.connected, "timers": p.timers_list(), "alarms": p.alarms_list(),
+             "reminders": p.reminders_list(), "notifications": len(p.s["notifications"]), "night": p.night_status()}
         mp = next((s for s in self.states.values() if isinstance(s, api.MediaPlayerEntityState)), None)
         if mp is not None:
             d["volume"] = round(mp.volume, 2)
             d["media_state"] = mp.state.name if hasattr(mp.state, "name") else mp.state
-        d["music"] = self.music.status()
+        d["music"] = {**self.music.status(), "sleep": p.sleep_status()}
         if entities:
             d["entities"] = []
             for e in sorted(self.entities.values(), key=lambda e: e.object_id):

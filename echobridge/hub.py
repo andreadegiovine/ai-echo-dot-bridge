@@ -16,6 +16,8 @@ class Hub:
         self.last_echo = None
         self.tags: dict[str, str] = {}              # tag_id -> ultima scansione (come tag.<id> in Home Assistant)
         self._bg = set()
+        from .planner import Store
+        self.store = Store()
         self.sendspin = None
         if c.SENDSPIN:
             try:
@@ -39,6 +41,19 @@ class Hub:
         if self.echos:
             return self.echos[0]
         raise ValueError("nessun Echo configurato")
+
+    @staticmethod
+    def is_all(ref):
+        return str(ref or "").strip().lower() in ("all", "tutti", "*")
+
+    def pick_many(self, ref=None):
+        """Come pick_esphome; con "all" (o "tutti") tutti gli Echo ESPHome collegati."""
+        if self.is_all(ref):
+            out = [e for e in self.echos if e.proto == "esphome" and e.connected]
+            if not out:
+                raise ValueError("nessun Echo collegato")
+            return out
+        return [self.pick_esphome(ref)]
 
     def pick_esphome(self, ref=None):
         e = self.pick(ref)
