@@ -16,6 +16,13 @@ class Hub:
         self.last_echo = None
         self.tags: dict[str, str] = {}              # tag_id -> ultima scansione (come tag.<id> in Home Assistant)
         self._bg = set()
+        self.sendspin = None
+        if c.SENDSPIN:
+            try:
+                from .sendspin_music import SendspinHub
+                self.sendspin = SendspinHub()
+            except ImportError as e:                     # aiosendspin non installato
+                log.warning("Sendspin non disponibile (%s): musica dal media player", e)
 
     # ------------------------------------------------------------ scelta dell'Echo
 

@@ -93,9 +93,17 @@ class EsphomeEcho:
         self.followup = None                        # (domanda, risposta, quando) se l'ultima risposta era una domanda
         self.last_active = 0.0
         self.keys = KeyStore()
-        self.music = Music(self)
+        self.url_music = Music(self)                  # musica dal media player (pausa e ripresa fatte dal bridge)
+        self.ss_music = None                          # musica via Sendspin (l'Echo la abbassa da solo)
+        if hub.sendspin is not None:
+            from .sendspin_music import SendspinMusic
+            self.ss_music = SendspinMusic(self, hub.sendspin)
         self._abort = False
         self._announcing = 0
+
+    @property
+    def music(self):
+        return self.ss_music if self.ss_music is not None and self.ss_music.ready else self.url_music
 
     def busy(self):
         """Una richiesta vocale o un annuncio in corso."""
@@ -181,6 +189,8 @@ class EsphomeEcho:
             cli.subscribe_voice_assistant(handle_start=self._va_start, handle_stop=self._va_stop,
                                           handle_audio=self._va_audio, handle_announcement_finished=self._va_announced)
             self.connected = True
+            if self.ss_music is not None and not self.ss_music.ready:
+                asyncio.get_running_loop().create_task(self.ss_music.setup())
             log.info("%s: collegato a \"%s\" (%s, cifrato: %s, %d entità)", self.label, self.name, self.info.model,
                      "sì" if key else "no", len(ents))
             self.timers.resend_all()
@@ -188,7 +198,7 @@ class EsphomeEcho:
             log.warning("%s: collegamento chiuso", self.label)
         finally:
             self.connected = False
-            self.music._halt()
+            self.url_music._halt()
             self.cli = None
             try:
                 await cli.disconnect()
@@ -202,7 +212,7 @@ class EsphomeEcho:
         self.state_seq[st.key] = self.state_seq.get(st.key, 0) + 1
         ent = self.entities.get(st.key)
         if isinstance(st, api.MediaPlayerEntityState):
-            self.music.on_media_state(st.state)
+            self.url_music.on_media_state(st.state)
         if isinstance(st, api.model.Event) and ent is not None:
             log.info("%s: evento %s: %s", self.name, ent.object_id, st.event_type)
             self.hub.webhook({"echo": self.name, "type": "event", "entity": ent.object_id, "event": st.event_type})
@@ -271,7 +281,7 @@ class EsphomeEcho:
             return None
         if self.run_task and not self.run_task.done():
             self.run_task.cancel()
-        self.music.on_run_start()
+        self.url_music.on_run_start()
         self._abort = False
         self.listener = speech.Listener()
         self.last_active = time.monotonic()
@@ -283,7 +293,7 @@ class EsphomeEcho:
 
     def _run_done(self, task):
         if task is self.run_task:                                 # non sostituita da una richiesta più nuova
-            self.music.on_run_end(aborted=self._abort)                                                  # 0 = audio sulla connessione API
+            self.url_music.on_run_end(aborted=self._abort)                                                  # 0 = audio sulla connessione API
 
     async def _va_stop(self, abort):
         if abort:
@@ -425,7 +435,7 @@ class EsphomeEcho:
             raise RuntimeError(f"{self.name} non è collegato")
         self._announcing += 1
         try:
-            await self.music.before_announce()                    # l'Echo suona un URL alla volta: pausa
+            await self.url_music.before_announce()                    # l'Echo suona un URL alla volta: pausa
             stream = audio.AudioStream()
             feeder = asyncio.get_running_loop().create_task(self._feed_text(stream, text))
             try:
@@ -437,7 +447,7 @@ class EsphomeEcho:
             return res.success
         finally:
             self._announcing -= 1
-            self.music.after_announce()
+            self.url_music.after_announce()
 
     async def _feed_text(self, stream, text):
         try:

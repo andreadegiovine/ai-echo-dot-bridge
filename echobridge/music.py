@@ -37,10 +37,10 @@ class Music:
 
     def status(self):
         if not self.session:
-            return {"state": "idle"}
+            return {"state": "idle", "backend": "url"}
         s = self.session
         return {"state": "playing" if self.playing else ("interrupted" if self.interrupted else "paused"),
-                "title": s["title"], "url": s["url"], "position": round(self._position()), "live": s["live"]}
+                "title": s["title"], "url": s["url"], "position": round(self._position()), "live": s["live"], "backend": "url"}
 
     def _position(self):
         s = self.session

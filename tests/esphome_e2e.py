@@ -310,7 +310,7 @@ async def phase_e():
     elog = lambda: read(s.echo_log)
     try:
         s.start_fakes(); s.start_echo(); await asyncio.sleep(1.5)
-        s.start_bridge(FOLLOWUP="0", EVENT_WEBHOOK="http://127.0.0.1:18311/hook")
+        s.start_bridge(FOLLOWUP="0", SENDSPIN="0", EVENT_WEBHOOK="http://127.0.0.1:18311/hook")
         check(await wait_for(lambda: "collegato a" in blog()), "collegato")
         st = api({"url": "http://127.0.0.1:18310/song.webm", "title": "Canzone", "headers": {"X-Test": "yt"}})
         check(st.get("state") == "playing", f"play: {st}")
@@ -366,6 +366,87 @@ async def phase_e():
         shutil.rmtree(s.dir, ignore_errors=True); shutil.rmtree(www, ignore_errors=True)
 
 
+async def phase_f():
+    print("== F. musica via Sendspin: l'Echo la abbassa per voce e annunci senza interromperla (come Alexa)")
+    import functools, http.server, json as js, re, threading, urllib.request
+    www = tempfile.mkdtemp()
+    for name, secs in (("song.webm", 90), ("short.webm", 3)):
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=330:duration={secs}",
+                        "-ac", "2", "-c:a", "libopus", "-b:a", "96k", os.path.join(www, name)], check=True)
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k): super().__init__(*a, directory=www, **k)
+        def log_message(self, *a): pass
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 18320), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    s = Setup(16977, 18184, False)
+    music = os.path.join(s.dir, "music.raw")
+    def api(path, body=None):
+        req = urllib.request.Request(f"http://127.0.0.1:{s.http_port}{path}", data=js.dumps(body).encode() if body else None,
+                                     headers={"Content-Type": "application/json"})
+        return js.loads(urllib.request.urlopen(req, timeout=60).read())
+    blog, elog = (lambda: read(s.bridge_log)), (lambda: read(s.echo_log))
+    msize = lambda: os.path.getsize(music) if os.path.exists(music) else 0
+    def levels(start):                                   # RMS per 100 ms della musica scritta dall'Echo da start in poi
+        d = np.fromfile(music, dtype="<i2")[start // 2:].astype(float)
+        n = len(d) // 9600
+        return np.sqrt((d[:n * 9600].reshape(n, 9600) ** 2).mean(axis=1)) if n else np.array([])
+    def ducked(start):                                   # abbassata (sotto metà) ma mai muta, e poi di nuovo piena
+        lv = levels(start)
+        if len(lv) < 5: return False
+        full = lv.max()
+        return lv.min() > 0.02 * full and lv.min() < 0.5 * full and lv[-1] > 0.8 * full
+    br = dict(FOLLOWUP="0", SENDSPIN_ECHO_PORT="16978", SENDSPIN_SERVER_PORT="18927")
+    try:
+        s.start_fakes(); s.start_echo(extra=("-z", "16978"), env={"HASSMIC_MUSIC": music, "HASSMIC_OUTPUT_LATENCY_MS": "0"})
+        await asyncio.sleep(1.5); s.start_bridge(**br)
+        check(await wait_for(lambda: "lettore Sendspin abbinato" in blog(), 25), "abbinato al lettore Sendspin con il token dell'Echo")
+        st = api("/api/music", {"url": "http://127.0.0.1:18320/song.webm", "title": "Canzone"})
+        check(st.get("backend") == "sendspin" and st["state"] == "playing", f"play via Sendspin: {st}")
+        check(await wait_for(lambda: "sendspin: stream start" in elog() and msize() > 96000, 15), "l'Echo riceve la musica dal suo lettore Sendspin")
+
+        await asyncio.sleep(2); m0 = msize(); s.wake()
+        check(await wait_for(lambda: "fine risposta" in blog(), 25), "la risposta arriva")
+        await asyncio.sleep(3)
+        lv = levels(m0)
+        print("     livelli dopo \"Alexa\" (ogni 0,5 s):", [int(x) for x in lv[::5]], flush=True)
+        check(ducked(m0), f"\"Alexa\": musica abbassata (livello {lv.min():.0f} contro {lv.max():.0f}), mai muta, poi di nuovo piena")
+        check("musica interrotta" not in blog() and api("/api/music")["state"] == "playing", "lo stato resta \"playing\"")
+
+        await asyncio.sleep(1); m0 = msize()
+        r = api("/api/announce", {"text": "La lavatrice ha finito."})
+        check(r.get("played") is True, "annuncio sopra la musica: riprodotto")
+        await asyncio.sleep(2)
+        lv = levels(m0)
+        check(ducked(m0) and api("/api/music")["state"] == "playing",
+              f"durante l'annuncio la musica si abbassa e continua (livello {lv.min():.0f} contro {lv.max():.0f})")
+
+        await asyncio.sleep(1); s.wake(); await asyncio.sleep(0.5); s.procs["echo"].send_signal(signal.SIGHUP)   # "Alexa, stop"
+        check(await wait_for(lambda: "pausa dall'Echo" in blog() and api("/api/music")["state"] == "paused", 8), "\"Alexa, stop\": in pausa")
+        n = blog().count("fine risposta") + blog().count("non hai detto niente")
+        await wait_for(lambda: blog().count("fine risposta") + blog().count("non hai detto niente") > n, 25)   # la richiesta finisce
+        await asyncio.sleep(2)
+        s.procs["echo"].send_signal(signal.SIGUSR2)                              # tasto azione
+        check(await wait_for(lambda: "ripresa dall'Echo" in blog() and api("/api/music")["state"] == "playing", 8),
+              "il tasto azione la riprende")
+        pos = api("/api/music")["position"]
+        check(pos >= 3, f"riprende dal punto in cui era: {pos} s")
+        check(api("/api/music", {"action": "stop"})["state"] == "idle", "stop dal tool")
+        api("/api/music", {"url": "http://127.0.0.1:18320/short.webm", "title": "Breve"})
+        check(await wait_for(lambda: "brano finito: Breve" in blog(), 20) and api("/api/music")["state"] == "idle",
+              "fine del brano riconosciuta")
+        api("/api/music", {"url": "http://127.0.0.1:18320/manca.webm", "title": "Sparito"})
+        check(await wait_for(lambda: "musica non riproducibile" in blog(), 15) and api("/api/music")["state"] == "idle",
+              "sorgente che non si apre: errore")
+
+        s.stop("bridge"); open(s.bridge_log, "w").close(); s.start_bridge(**br)
+        check(await wait_for(lambda: "lettore Sendspin collegato" in blog(), 25), "riavvio del bridge: abbinamento salvato, nessun nuovo abbinamento")
+    finally:
+        s.close(); httpd.shutdown()
+        if FAILED:
+            print("--- bridge.log ---\n" + read(s.bridge_log)[-4000:]); print("--- echo ---\n" + read(s.echo_log)[-4000:])
+        shutil.rmtree(s.dir, ignore_errors=True); shutil.rmtree(www, ignore_errors=True)
+
+
 async def main():
     if os.environ.get("ONLY"):
         await globals()["phase_" + os.environ["ONLY"]]()
@@ -376,6 +457,7 @@ async def main():
     await phase_c()
     await phase_d()
     await phase_e()
+    await phase_f()
     print("TUTTI I TEST ESPHOME OK" if not FAILED else f"FALLITI: {len(FAILED)}")
     sys.exit(1 if FAILED else 0)
 

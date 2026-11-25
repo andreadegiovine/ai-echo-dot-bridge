@@ -47,8 +47,9 @@ ripete i test a ogni push. In modalità ESPHome coprono: cifratura impostata dal
 data all'Echo, wake word, fine frase, risposta in streaming, domanda di seguito senza "Alexa", sussurro dal sensore
 nativo dell'Echo, timer (avvio, pausa, annullo, suoneria, anche via REST), annunci, volume, "non disturbare", tasti
 come eventi e webhook, due Echo che entrano nella stessa rete di arbitraggio, agente lento oltre i 30 s, musica da una
-sorgente Opus come quelle di YouTube (conversione, pausa e ripresa per voce e annunci, "Alexa, stop", coda durante una
-risposta, fine del brano), attraverso gli strumenti MCP e l'API REST. In modalità Wyoming: voce, sussurro stimato, agente lento. **Non è stato provato su un Echo vero, né
+sorgente Opus come quelle di YouTube via Sendspin (abbinamento automatico e salvato, musica abbassata e mai interrotta
+durante "Alexa" e gli annunci, "Alexa, stop", tasto azione, fine del brano, errore) e nel ripiego dal media player
+(pausa e ripresa), attraverso gli strumenti MCP e l'API REST. In modalità Wyoming: voce, sussurro stimato, agente lento. **Non è stato provato su un Echo vero, né
 con Whisper e Piper veri**: la prima prova reale sarà la tua.
 
 ---
@@ -132,8 +133,9 @@ Lo script:
 | `webrtcvad-wheels` 2.0.14 | rileva quando hai smesso di parlare |
 | `httpx` 0.28.1 | chiamate in streaming all'agente |
 | `numpy` 2.5.5 | riconoscimento del sussurro e attenuazione dell'audio |
-| `ffmpeg` (pacchetto Debian) | converte la musica in MP3 per l'Echo |
+| `ffmpeg` (pacchetto Debian) | decodifica la musica (YouTube e altre sorgenti) |
 | `aioesphomeapi` 46.25.0 | protocollo ESPHome: la libreria di Home Assistant, la stessa versione dei test di hassmic |
+| `aiosendspin[server]` 10.2.1 | server di musica Sendspin (la libreria di Music Assistant) |
 | `mcp` 2.3.0, `uvicorn`, `starlette` | server HTTP del bridge: audio per l'Echo e strumenti MCP per l'agente |
 
 ### A4. Collega l'agente
@@ -388,7 +390,7 @@ INFO Echo Dot 3 5695c4: fine risposta (1 frasi)
 | **Sussurro** | il sensore dell'Echo con il modello originale di Amazon, se è installato; altrimenti la stima del bridge |
 | **Timer** | li chiede l'agente con `set_timer`; l'anello mostra il tempo, alla fine suona; "Alexa, stop" o il tasto lo fermano |
 | **Annunci** | `announce` (MCP) o `POST /api/announce`; con `listen=true` l'Echo poi ascolta la risposta |
-| **Musica** | da un URL, anche YouTube: il bridge la converte, la mette in pausa per voce e annunci e la riprende ([D2](#d2-musica-dal-tool-sullecho)) |
+| **Musica** | da un URL, anche YouTube, nel lettore Sendspin dell'Echo: come Alexa si abbassa per voce e annunci, senza fermarsi ([D2](#d2-musica-dal-tool-sullecho)) |
 | **Più Echo: risponde solo il più vicino** | gli Echo si scambiano la chiave della loro rete attraverso il bridge, come attraverso Home Assistant |
 | **Drop In** tra Echo | `run_action` con `drop_in`; la chiamata va da Echo a Echo |
 | **Impostazioni e sensori** | `echo_status` e `set_entity`: non disturbare, suoni, luce dell'anello, equalizzatore, wake word, aggiornamenti |
@@ -396,8 +398,9 @@ INFO Echo Dot 3 5695c4: fine risposta (1 frasi)
 | **Annunci Bluetooth** ("Connesso a …") | l'Echo li chiede e il bridge li pronuncia |
 | **Aggiornamenti di hassmic** | canale scelto nella pagina impostazioni dell'Echo; installazione con `set_entity` sull'entità di aggiornamento |
 
-Restano fuori il proxy Bluetooth (serve solo a Home Assistant) e l'abbinamento automatico con Music Assistant, che
-passa da Home Assistant 2026.11: Music Assistant si abbina comunque a mano con il token dell'Echo.
+Resta fuori il proxy Bluetooth, che serve solo a Home Assistant. Per la musica il bridge fa già da server Sendspin al
+posto di Music Assistant; se preferisci Music Assistant, imposta `SENDSPIN=0` e abbinalo a mano con il token dell'Echo
+(l'abbinamento automatico passa da Home Assistant).
 
 ### Tasti e anello, una volta in funzione
 
@@ -527,16 +530,22 @@ l'ultimo passaggio: invece di suonarlo su un altro dispositivo, passa al bridge 
 Perché passare dal bridge e non dare l'URL all'Echo direttamente:
 
 - **Il firewall dell'Echo** lo lascia parlare solo con la rete locale, quindi non può scaricare da YouTube.
-- **I formati:** l'Echo legge solo WAV e MP3, mentre YouTube dà Opus o AAC. Il bridge converte con ffmpeg.
-- **Un URL alla volta:** hassmic suona un solo URL per volta. Se dici "Alexa" mentre suona, taglia la musica e non la
-  riprende, e un annuncio che arriva mentre suona viene scartato. Il bridge invece mette in pausa la musica e la
+- **I formati:** YouTube dà Opus o AAC. Il bridge decodifica con ffmpeg.
+- **Come Alexa, la musica si abbassa e non si ferma.** Il bridge fa da server di musica per il lettore Sendspin
+  dell'Echo, il protocollo di Music Assistant (con la stessa libreria, `aiosendspin`). È il lettore nativo di hassmic:
+  quando dici "Alexa" o arriva un annuncio l'Echo abbassa la musica da solo (16 dB, "Music ducking" nella sua pagina
+  impostazioni), ti sente, risponde sopra la musica e poi la riporta al volume di prima. Con più Echo che hanno sentito
+  "Alexa", la abbassano tutti. L'abbinamento lo fa il bridge da solo, con il token che l'Echo gli dà sul collegamento
+  cifrato: nel log `lettore Sendspin abbinato`.
+- **Ripiego senza Sendspin** (`SENDSPIN=0`, o un Echo con Sendspin spento): la musica passa dal media player, che
+  suona un URL alla volta. Lì il bridge non può abbassarla: la mette in pausa quando parli o c'è un annuncio e la
   riprende dal punto in cui era.
 
 | `POST /api/music` | Campi | Risposta |
 |---|---|---|
-| play | `{"action": "play", "url": "…", "headers": {…}, "title": "…", "seek": 0, "live": false, "echo": "…"}` | `{"echo", "state", "title", "url", "position", "live"}` |
+| play | `{"action": "play", "url": "…", "headers": {…}, "title": "…", "seek": 0, "live": false, "echo": "…"}` | `{"echo", "state", "title", "url", "position", "live", "backend"}` |
 | pause / resume / stop | `{"action": "pause"}`, `{"action": "resume"}`, `{"action": "stop"}` | lo stato aggiornato |
-| stato | `GET /api/music?echo=…` | `state`: `playing`, `paused`, `interrupted` (in pausa per voce o annuncio, riprende da sola) o `idle` |
+| stato | `GET /api/music?echo=…` | `state`: `playing`, `paused` o `idle` (nel ripiego anche `interrupted`: in pausa per voce o annuncio, riprende da sola); `backend`: `sendspin` o `url` |
 
 - `url`: l'URL diretto dell'audio, quello che la libreria ricava (con yt-dlp è `info["url"]`, non il link della pagina).
 - `headers`: le intestazioni HTTP che la sorgente vuole (con yt-dlp `info["http_headers"]`); il bridge le passa a ffmpeg.
@@ -569,17 +578,19 @@ async def musica(comando: str, echo: str = "") -> str:              # pause, res
         return r.json()["state"]
 ```
 
-Cosa fa il bridge mentre la musica suona:
+Cosa succede mentre la musica suona:
 
-| Succede | Il bridge |
-|---|---|
-| Dici "Alexa" o premi il tasto | mette in pausa, ti ascolta e risponde, poi riprende dal punto in cui era |
-| L'agente avvia la musica mentre sta ancora rispondendo ("Alexa, metti i Queen") | la tiene in coda e la fa partire a risposta finita, così la risposta non viene tagliata |
-| Arriva un annuncio (D1) | pausa, annuncio, ripresa |
-| Dici "Alexa, stop" | la mette in pausa e non la riprende da sola. Il tool può chiamare `resume` |
-| Il tool chiama `pause` o `stop` (per esempio "Alexa, ferma la musica" all'agente) | pausa o stop. Dopo la risposta non riprende |
-| Il brano finisce | stato `idle`; con `EVENT_WEBHOOK` arriva `{"type": "music", "event": "finished", "title": "…"}` |
-| La sorgente non si apre (URL scaduto, 403) | stato `idle`; nel webhook `"event": "error"` con il messaggio di ffmpeg |
+| Succede | Con Sendspin (default) | Nel ripiego dal media player |
+|---|---|---|
+| Dici "Alexa" | la musica si abbassa, l'Echo ti ascolta e risponde, poi torna al volume di prima | pausa, risposta, ripresa dal punto in cui era |
+| Arriva un annuncio (D1) | la musica si abbassa sotto l'annuncio | pausa, annuncio, ripresa |
+| L'agente avvia la musica mentre sta ancora rispondendo ("Alexa, metti i Queen") | parte subito, abbassata finché la risposta non è finita | la tiene in coda e la fa partire a risposta finita |
+| Dici "Alexa, stop" | pausa, non riprende da sola | pausa, non riprende da sola |
+| Premi il tasto azione | pausa; premuto di nuovo, riprende | nuova richiesta (come "Alexa") |
+| Il tool chiama `pause`, `resume`, `stop` (per esempio "Alexa, ferma la musica" all'agente) | eseguito | eseguito; dopo una pausa non riprende da sola |
+| Il brano finisce | stato `idle`; con `EVENT_WEBHOOK` arriva `{"type": "music", "event": "finished", "title": "…"}` | uguale |
+| La sorgente non si apre (URL scaduto, 403) | stato `idle`; nel webhook `"event": "error"` con il messaggio di ffmpeg | uguale |
+| Pausa dall'Echo ("stop", tasto) | nel webhook `"event": "paused"` | uguale |
 
 - **Coda e playlist:** le gestisce il tool. Al webhook `finished` (o controllando `GET /api/music` ogni tanto), il tool
   manda il `play` del brano successivo. Il webhook è quello di `EVENT_WEBHOOK` in `echo-bridge.env`: può essere un
@@ -588,7 +599,11 @@ Cosa fa il bridge mentre la musica suona:
 - **URL di YouTube:** scadono dopo qualche ora e sono legati all'indirizzo IP pubblico di chi li ha ricavati. Il tool
   e il bridge dietro lo stesso router vanno bene. Se il tool esce da un'altra connessione (VPN), ffmpeg riceve 403: in
   quel caso il tool scarica il file e lo serve sulla rete locale via HTTP, e passa quell'URL al bridge.
-- L'Echo Dot ha un solo altoparlante: il bridge manda un MP3 stereo a 192 kbit/s, e l'Echo lo riproduce in mono.
+- **Music Assistant:** il lettore Sendspin dell'Echo accetta un solo server alla volta. Se vuoi usare Music
+  Assistant al posto del bridge per la musica, imposta `SENDSPIN=0`.
+- **Porte:** il bridge si collega al lettore Sendspin dell'Echo (porta 28928, `SENDSPIN_ECHO_PORT`) e ascolta sulla
+  8927 (`SENDSPIN_SERVER_PORT`).
+- L'Echo Dot ha un solo altoparlante: riceve la musica stereo a 48 kHz e la riproduce in mono.
 
 ---
 
@@ -746,6 +761,7 @@ espeak-ng -v it -w voce.wav "Alexa, accendi la luce del soggiorno e dimmi che te
 - [R0rt1z2](https://xdaforums.com/t/unlock-root-twrp-unbrick-amazon-echo-dot-3rd-gen-2018-donut.4801400/): exploit,
   TWRP e root dell'Echo Dot 3.
 - [aioesphomeapi](https://github.com/esphome/aioesphomeapi) (il protocollo ESPHome, dalla libreria di Home Assistant),
+  [aiosendspin](https://pypi.org/project/aiosendspin/) (Sendspin, la libreria di Music Assistant),
   [MCP Python SDK](https://github.com/modelcontextprotocol/python-sdk).
 - [Wyoming](https://github.com/OHF-Voice/wyoming), [wyoming-faster-whisper](https://github.com/rhasspy/wyoming-faster-whisper),
   [wyoming-piper](https://github.com/rhasspy/wyoming-piper).

@@ -77,5 +77,8 @@ HOME_LATITUDE = env("HOME_LATITUDE", "")
 HOME_LONGITUDE = env("HOME_LONGITUDE", "")
 EVENT_WEBHOOK = env("EVENT_WEBHOOK", "")             # URL a cui inoltrare tasti, eventi e azioni dell'Echo (POST JSON)
 ANNOUNCE_TIMEOUT = env("ANNOUNCE_TIMEOUT", 120.0, float)
+SENDSPIN = flag("SENDSPIN", True)                    # musica via Sendspin (abbassa per voce e annunci) se l'Echo lo ha
+SENDSPIN_SERVER_PORT = env("SENDSPIN_SERVER_PORT", 8927, int)
+SENDSPIN_ECHO_PORT = env("SENDSPIN_ECHO_PORT", 28928, int)
 
 LOG_LEVEL = env("LOG_LEVEL", "INFO")

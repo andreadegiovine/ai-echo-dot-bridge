@@ -11,3 +11,5 @@ aioesphomeapi==46.25.0
 mcp==2.3.0
 uvicorn==0.54.0
 starlette==1.10.0
+# musica via Sendspin (il protocollo di Music Assistant): l'Echo la abbassa da solo per voce e annunci
+aiosendspin[server]==10.2.1
