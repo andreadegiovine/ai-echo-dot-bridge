@@ -4,6 +4,8 @@
   POST /mcp                server MCP (streamable HTTP): l'agente comanda gli Echo con i suoi strumenti
   GET  /api/echos          stato degli Echo
   POST /api/announce       {"text": "...", "echo": "...", "listen": false}
+  POST /api/timers         {"action": "start", "seconds": 600, "name": "pasta"}  (cancel, pause, resume, add; GET: elenco)
+  POST /api/music          {"action": "play", "url": "...", "headers": {...}, "title": "..."}  (pause, resume, stop; GET)
   GET  /healthz
 """
 import json
@@ -73,12 +75,17 @@ def build(hub: Hub):
         e.set_volume(level / 100)
         return f"volume di {e.name} a {level}"
 
-    @mcp.tool(description="Riproduce un URL audio (http, sulla rete locale) o comanda la riproduzione: "
-                          "command = play, pause, stop, mute, unmute, volume_up, volume_down.")
-    async def media(command: str = "", url: str = "", echo: str = "") -> str:
+    @mcp.tool(description="Musica sull'Echo. url: audio da riprodurre (anche da internet: il bridge lo converte e lo "
+                          "passa all'Echo; per YouTube l'URL audio diretto, con i suoi headers). title: titolo per i log. "
+                          "seek: da quale secondo. live=true per radio e dirette. Senza url, command = pause, resume, "
+                          "stop, status, mute, unmute, volume_up, volume_down. Mentre l'utente parla o c'è un annuncio "
+                          "la musica va in pausa e poi riprende da sola.")
+    async def media(command: str = "", url: str = "", title: str = "", headers: dict | None = None,
+                    seek: float = 0.0, live: bool = False, echo: str = "") -> dict:
         e = hub.pick_esphome(echo or None)
-        e.media(command=command or None, url=url or None)
-        return "ok"
+        if command == "status" and not url:
+            return e.music.status()
+        return e.media(command=command or None, url=url or None, title=title, headers=headers, seek=seek, live=live)
 
     @mcp.tool(description="Comanda un'entità dell'Echo (vedi echo_status): interruttori (value on/off), numeri, "
                           "selettori, pulsanti, aggiornamento (value install), luce dell'anello (value on/off, "
@@ -98,10 +105,10 @@ def build(hub: Hub):
 
     @mcp.custom_route("/audio/{name}", methods=["GET"])
     async def audio_route(request: Request) -> Response:
-        s = audio.get(request.path_params["name"].removesuffix(".wav"))
+        s = audio.get(request.path_params["name"].split(".")[0])
         if s is None:
             return Response(status_code=404)
-        return StreamingResponse(s.read(), media_type="audio/wav")
+        return StreamingResponse(s.read(), media_type=getattr(s, "media_type", "audio/wav"))
 
     @mcp.custom_route("/healthz", methods=["GET"])
     async def health(request: Request) -> Response:
@@ -120,6 +127,53 @@ def build(hub: Hub):
         except (ValueError, KeyError, RuntimeError) as ex:
             return JSONResponse({"error": str(ex)}, status_code=400)
         return JSONResponse({"echo": e.name, "played": ok})
+
+    @mcp.custom_route("/api/timers", methods=["GET", "POST"])
+    async def api_timers(request: Request) -> Response:
+        try:
+            if request.method == "GET":
+                e = hub.pick_esphome(request.query_params.get("echo") or None)
+                return JSONResponse({"echo": e.name, "timers": e.timers.list()})
+            body = await request.json()
+            e = hub.pick_esphome(body.get("echo") or None)
+            t, action, name = e.timers, body.get("action", "start"), body.get("name") or None
+            if action == "start":
+                out = [t.start(int(body["seconds"]), body.get("name", ""))]
+            elif action == "cancel":
+                out = t.cancel(name, all_=bool(body.get("all")))
+            elif action == "pause":
+                out = t.pause(name)
+            elif action == "resume":
+                out = t.resume(name)
+            elif action == "add":
+                out = t.add(name, int(body["seconds"]))
+            else:
+                return JSONResponse({"error": f"azione sconosciuta: {action}"}, status_code=400)
+        except (ValueError, KeyError, RuntimeError) as ex:
+            return JSONResponse({"error": str(ex)}, status_code=400)
+        return JSONResponse({"echo": e.name, "timers": [x.describe() for x in out]})
+
+    @mcp.custom_route("/api/music", methods=["GET", "POST"])
+    async def api_music(request: Request) -> Response:
+        try:
+            if request.method == "GET":
+                e = hub.pick_esphome(request.query_params.get("echo") or None)
+                return JSONResponse({"echo": e.name, **e.music.status()})
+            body = await request.json()
+            e = hub.pick_esphome(body.get("echo") or None)
+            action = body.get("action", "play" if body.get("url") else "status")
+            if action == "play":
+                st = e.music.play(body["url"], body.get("title", ""), body.get("headers"), float(body.get("seek", 0)),
+                                  bool(body.get("live")))
+            elif action in ("pause", "resume", "stop"):
+                st = e.media(command=action)
+            elif action == "status":
+                st = e.music.status()
+            else:
+                return JSONResponse({"error": f"azione sconosciuta: {action}"}, status_code=400)
+        except (ValueError, KeyError, RuntimeError) as ex:
+            return JSONResponse({"error": str(ex)}, status_code=400)
+        return JSONResponse({"echo": e.name, **st})
 
     app = mcp.streamable_http_app(
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False), host=c.HTTP_HOST)

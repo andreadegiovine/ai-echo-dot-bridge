@@ -89,7 +89,58 @@ class AudioStream:
                 self.chunk(value)
 
 
-def get(stream_id) -> AudioStream | None:
+class ProcStream:
+    """Musica: ffmpeg legge la sorgente (es. l'URL audio di YouTube) e la converte in MP3, che l'Echo sa suonare.
+    ffmpeg parte quando l'Echo apre l'URL e si ferma quando l'Echo chiude o con close()."""
+    media_type = "audio/mpeg"
+
+    def __init__(self, url, headers=None, seek=0.0, live=False):
+        self.id = uuid.uuid4().hex
+        self.url, self.headers, self.seek, self.live = url, headers or {}, seek, live
+        self.created = time.monotonic()
+        self.proc = None
+        self.finished = False                     # la sorgente è finita (fine del brano), non interrotta
+        self.error = ""
+        _streams[self.id] = self
+        _gc()
+
+    @property
+    def path(self):
+        return f"/audio/{self.id}.mp3"
+
+    def command(self):
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error"]
+        if self.headers:
+            cmd += ["-headers", "".join(f"{k}: {v}\r\n" for k, v in self.headers.items())]
+        if self.url.startswith(("http://", "https://")):
+            cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        if self.seek > 0 and not self.live:
+            cmd += ["-ss", f"{self.seek:.1f}"]
+        return cmd + ["-i", self.url, "-vn", "-ac", "2", "-ar", "44100", "-c:a", "libmp3lame", "-b:a", "192k",
+                      "-f", "mp3", "pipe:1"]
+
+    async def read(self):
+        self.close()
+        self.proc = proc = await asyncio.create_subprocess_exec(
+            *self.command(), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            while data := await proc.stdout.read(16384):
+                yield data
+            await proc.wait()
+            if proc.returncode == 0:
+                self.finished = True
+            else:
+                self.error = (await proc.stderr.read()).decode(errors="replace").strip()[-300:]
+        finally:
+            if proc.returncode is None:
+                proc.kill()
+
+    def close(self):
+        if self.proc and self.proc.returncode is None:
+            self.proc.kill()
+
+
+def get(stream_id) -> "AudioStream | ProcStream | None":
     return _streams.get(stream_id)
 
 

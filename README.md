@@ -45,9 +45,10 @@ Il bridge è provato end-to-end contro il simulatore di hassmic (`build/hassmic-
 con STT, TTS e agente finti. La [CI](https://github.com/andreadegiovine/ai-echo-dot-bridge/actions/workflows/ci.yml)
 ripete i test a ogni push. In modalità ESPHome coprono: cifratura impostata dal bridge e riusata dopo un riavvio, ora
 data all'Echo, wake word, fine frase, risposta in streaming, domanda di seguito senza "Alexa", sussurro dal sensore
-nativo dell'Echo, timer (avvio, pausa, annullo, suoneria), annunci, volume, "non disturbare", tasti come eventi e
-webhook, due Echo che entrano nella stessa rete di arbitraggio, agente lento oltre i 30 s, tutto attraverso gli
-strumenti MCP. In modalità Wyoming: voce, sussurro stimato, agente lento. **Non è stato provato su un Echo vero, né
+nativo dell'Echo, timer (avvio, pausa, annullo, suoneria, anche via REST), annunci, volume, "non disturbare", tasti
+come eventi e webhook, due Echo che entrano nella stessa rete di arbitraggio, agente lento oltre i 30 s, musica da una
+sorgente Opus come quelle di YouTube (conversione, pausa e ripresa per voce e annunci, "Alexa, stop", coda durante una
+risposta, fine del brano), attraverso gli strumenti MCP e l'API REST. In modalità Wyoming: voce, sussurro stimato, agente lento. **Non è stato provato su un Echo vero, né
 con Whisper e Piper veri**: la prima prova reale sarà la tua.
 
 ---
@@ -131,6 +132,7 @@ Lo script:
 | `webrtcvad-wheels` 2.0.14 | rileva quando hai smesso di parlare |
 | `httpx` 0.28.1 | chiamate in streaming all'agente |
 | `numpy` 2.5.5 | riconoscimento del sussurro e attenuazione dell'audio |
+| `ffmpeg` (pacchetto Debian) | converte la musica in MP3 per l'Echo |
 | `aioesphomeapi` 46.25.0 | protocollo ESPHome: la libreria di Home Assistant, la stessa versione dei test di hassmic |
 | `mcp` 2.3.0, `uvicorn`, `starlette` | server HTTP del bridge: audio per l'Echo e strumenti MCP per l'agente |
 
@@ -190,7 +192,7 @@ mandare `Authorization: Bearer <token>`.
 |---|---|
 | `set_timer`, `list_timers`, `cancel_timer`, `pause_timer`, `change_timer` | timer sull'Echo: l'anello mostra il tempo, alla fine suona finché non lo fermi ("Alexa, stop" o tasto) |
 | `announce` | fa dire un testo a un Echo; con `listen=true` poi ascolta la risposta e la passa all'agente |
-| `set_volume`, `media` | volume; riproduzione di un URL audio della rete locale, pausa, stop |
+| `set_volume`, `media` | volume; musica da un URL (anche YouTube, vedi [D2](#d2-musica-dal-tool-sullecho)): play, pause, resume, stop, status |
 | `echo_status`, `set_entity` | tutte le impostazioni e i sensori dell'Echo: non disturbare, suoni, luce dell'anello, equalizzatore, wake word, aggiornamenti… |
 | `run_action` | azioni dell'Echo, per esempio `drop_in` con `{"target": "Echo Cucina"}` per chiamare un altro Echo |
 | `list_echos` | Echo collegati, volume e timer in corso |
@@ -199,7 +201,8 @@ Senza il parametro `echo` gli strumenti agiscono sull'Echo che ha ricevuto l'ult
 sta parlando chi ha chiesto "metti un timer di 10 minuti". Con più Echo l'agente può nominarli, per esempio
 `echo: "Echo Cucina"`.
 
-C'è anche una piccola API REST, utile per automazioni e script:
+C'è anche una piccola API REST, per i tuoi tool MCP, automazioni e script: annunci, timer e musica. Come usarla
+dai tool è spiegato nella [parte D](#parte-d--i-tuoi-tool-mcp-e-lecho).
 
 ```bash
 curl -X POST http://<ip-echo-bridge>:8124/api/announce -H 'Content-Type: application/json' \
@@ -385,6 +388,7 @@ INFO Echo Dot 3 5695c4: fine risposta (1 frasi)
 | **Sussurro** | il sensore dell'Echo con il modello originale di Amazon, se è installato; altrimenti la stima del bridge |
 | **Timer** | li chiede l'agente con `set_timer`; l'anello mostra il tempo, alla fine suona; "Alexa, stop" o il tasto lo fermano |
 | **Annunci** | `announce` (MCP) o `POST /api/announce`; con `listen=true` l'Echo poi ascolta la risposta |
+| **Musica** | da un URL, anche YouTube: il bridge la converte, la mette in pausa per voce e annunci e la riprende ([D2](#d2-musica-dal-tool-sullecho)) |
 | **Più Echo: risponde solo il più vicino** | gli Echo si scambiano la chiave della loro rete attraverso il bridge, come attraverso Home Assistant |
 | **Drop In** tra Echo | `run_action` con `drop_in`; la chiamata va da Echo a Echo |
 | **Impostazioni e sensori** | `echo_status` e `set_entity`: non disturbare, suoni, luce dell'anello, equalizzatore, wake word, aggiornamenti |
@@ -427,6 +431,164 @@ INFO 192.168.1.50: hai detto: 'spegni la luce' (sussurrato, parlato con tono 3%:
 - **La risposta non è sussurrata:** Piper non sa sussurrare, quindi è la stessa voce a volume più basso.
 - **Wake word nella richiesta:** se attivi "Wake word in the request" nella pagina impostazioni di hassmic, anche
   "Alexa" detto a voce normale entra nel calcolo e un sussurro potrebbe non essere riconosciuto. Di default è spento.
+
+---
+
+## Parte D — I tuoi tool MCP e l'Echo
+
+I tuoi tool MCP girano altrove (nel loro server MCP) e non parlano con l'Echo direttamente. Quando un tool deve far
+sentire qualcosa sull'Echo chiama l'API REST del bridge: `http://<ip-echo-bridge>:8124/api/...`, JSON in ingresso e
+in uscita.
+
+- **Autenticazione:** se nel bridge hai impostato `API_TOKEN`, ogni chiamata vuole `Authorization: Bearer <token>`.
+- **Quale Echo:** il campo `echo` accetta il nome dell'Echo (quello di `GET /api/echos`), il nome del nodo o l'IP.
+  Senza `echo` il bridge usa l'Echo che ha ricevuto l'ultima richiesta vocale: di solito è giusto, perché il tool è
+  stato avviato proprio da una richiesta fatta a quell'Echo. Se il tool lavora a lungo e in casa ci sono più Echo,
+  conviene che l'agente gli passi il nome (lo trova con lo strumento MCP `list_echos`) e che il tool lo ricordi.
+- **Errori:** risposta HTTP 400 con `{"error": "..."}`, per esempio con un Echo sconosciuto o scollegato.
+
+Negli esempi qui sotto:
+
+```python
+import asyncio, httpx
+
+BRIDGE = "http://192.168.1.30:8124"                      # container echo-bridge
+TOKEN = ""                                               # API_TOKEN del bridge, se impostato
+AUTH = {"Authorization": f"Bearer {TOKEN}"} if TOKEN else {}
+```
+
+### D1. Avvisare l'Echo quando un tool finisce
+
+Il tool fa il suo lavoro in background, risponde subito all'agente ("ok, ti avviso io") e alla fine chiama il bridge.
+Ci sono due modi.
+
+**Timer: il suono nativo dell'Echo (consigliato).** Se il tool gestisce un timer, lo registra anche sul bridge con la
+stessa durata. Alla fine l'Echo suona come un timer di Alexa: l'anello mostra il tempo che resta, la suoneria va
+avanti finché non dici "Alexa, stop" o premi il tasto.
+
+| `POST /api/timers` | Campi | Risposta |
+|---|---|---|
+| avvio | `{"action": "start", "seconds": 600, "name": "pasta", "echo": "…"}` | `{"echo": "…", "timers": [{"id", "name", "total_seconds", "seconds_left", "active"}]}` |
+| annullo | `{"action": "cancel", "name": "pasta"}` (oppure `"all": true`) | i timer annullati |
+| pausa / ripresa | `{"action": "pause", "name": "pasta"}`, `{"action": "resume", "name": "pasta"}` | i timer cambiati |
+| più o meno tempo | `{"action": "add", "name": "pasta", "seconds": 60}` (negativo per togliere) | i timer cambiati |
+| elenco | `GET /api/timers?echo=…` | `{"echo": "…", "timers": [...]}` |
+
+Senza `name`, annullo, pausa e ripresa agiscono sull'unico timer in corso. I timer vivono nella memoria del bridge: un
+riavvio del bridge li cancella.
+
+```python
+async def timer_su_echo(secondi: int, nome: str = "", echo: str | None = None) -> dict:
+    body = {"action": "start", "seconds": secondi, "name": nome, **({"echo": echo} if echo else {})}
+    async with httpx.AsyncClient(timeout=10) as http:
+        r = await http.post(f"{BRIDGE}/api/timers", json=body, headers=AUTH)
+        r.raise_for_status()
+        return r.json()
+```
+
+**Qualsiasi altro tool: un annuncio a voce.** A lavoro finito il tool fa dire una frase all'Echo.
+
+| `POST /api/announce` | Campo | Significato |
+|---|---|---|
+| | `text` (obbligatorio) | la frase da dire |
+| | `echo` | su quale Echo (vedi sopra) |
+| | `listen` | `true`: dopo l'annuncio l'Echo ascolta la risposta e la manda all'agente come una normale richiesta, senza "Alexa" |
+| risposta | `{"echo": "…", "played": true}` | `played: false` se l'Echo non l'ha suonato, per esempio con "non disturbare" attivo |
+
+La chiamata ritorna quando l'Echo ha finito di parlare, al massimo dopo `ANNOUNCE_TIMEOUT` (120 s): usa un timeout
+più lungo. Se c'è musica, si mette in pausa durante l'annuncio e poi riprende.
+
+```python
+_lavori = set()                                          # tiene vivi i task in background
+
+async def avvisa_echo(testo: str, echo: str | None = None, ascolta: bool = False) -> bool:
+    body = {"text": testo, "listen": ascolta, **({"echo": echo} if echo else {})}
+    async with httpx.AsyncClient(timeout=150) as http:
+        r = await http.post(f"{BRIDGE}/api/announce", json=body, headers=AUTH)
+        r.raise_for_status()
+        return r.json()["played"]
+
+@mcp.tool()                                              # il tuo server MCP
+async def scarica_backup(echo: str = "") -> str:
+    async def lavoro():
+        ...                                              # il lavoro vero e proprio
+        await avvisa_echo("Il backup è finito.", echo or None)
+    t = asyncio.create_task(lavoro()); _lavori.add(t); t.add_done_callback(_lavori.discard)
+    return "Backup avviato: ti avviso sull'Echo quando ha finito."
+```
+
+Con `ascolta=True` l'avviso può diventare una domanda: "Il bucato è pronto, vuoi che te lo ricordi tra mezz'ora?".
+
+### D2. Musica dal tool sull'Echo
+
+Il tool continua a fare quello che fa oggi: cerca su YouTube con la sua libreria e ricava l'audio. Cambia solo
+l'ultimo passaggio: invece di suonarlo su un altro dispositivo, passa al bridge l'URL dell'audio.
+
+Perché passare dal bridge e non dare l'URL all'Echo direttamente:
+
+- **Il firewall dell'Echo** lo lascia parlare solo con la rete locale, quindi non può scaricare da YouTube.
+- **I formati:** l'Echo legge solo WAV e MP3, mentre YouTube dà Opus o AAC. Il bridge converte con ffmpeg.
+- **Un URL alla volta:** hassmic suona un solo URL per volta. Se dici "Alexa" mentre suona, taglia la musica e non la
+  riprende, e un annuncio che arriva mentre suona viene scartato. Il bridge invece mette in pausa la musica e la
+  riprende dal punto in cui era.
+
+| `POST /api/music` | Campi | Risposta |
+|---|---|---|
+| play | `{"action": "play", "url": "…", "headers": {…}, "title": "…", "seek": 0, "live": false, "echo": "…"}` | `{"echo", "state", "title", "url", "position", "live"}` |
+| pause / resume / stop | `{"action": "pause"}`, `{"action": "resume"}`, `{"action": "stop"}` | lo stato aggiornato |
+| stato | `GET /api/music?echo=…` | `state`: `playing`, `paused`, `interrupted` (in pausa per voce o annuncio, riprende da sola) o `idle` |
+
+- `url`: l'URL diretto dell'audio, quello che la libreria ricava (con yt-dlp è `info["url"]`, non il link della pagina).
+- `headers`: le intestazioni HTTP che la sorgente vuole (con yt-dlp `info["http_headers"]`); il bridge le passa a ffmpeg.
+- `seek`: da quale secondo partire. `live: true` per radio e dirette, che non si possono riavvolgere.
+- Un nuovo `play` sostituisce il brano in corso.
+
+```python
+import yt_dlp
+
+def audio_youtube(ricerca: str) -> dict:                 # quello che il tool fa già oggi
+    opts = {"format": "bestaudio/best", "quiet": True, "noplaylist": True}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(f"ytsearch1:{ricerca}", download=False)["entries"][0]
+    return {"url": info["url"], "headers": info.get("http_headers", {}), "title": info.get("title", ricerca)}
+
+@mcp.tool()
+async def riproduci(ricerca: str, echo: str = "") -> str:
+    audio = await asyncio.to_thread(audio_youtube, ricerca)          # yt-dlp è bloccante
+    body = {"action": "play", **audio, **({"echo": echo} if echo else {})}
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.post(f"{BRIDGE}/api/music", json=body, headers=AUTH)
+        r.raise_for_status()
+    return f"In riproduzione sull'Echo: {audio['title']}"
+
+@mcp.tool()
+async def musica(comando: str, echo: str = "") -> str:              # pause, resume, stop
+    async with httpx.AsyncClient(timeout=15) as http:
+        r = await http.post(f"{BRIDGE}/api/music", json={"action": comando, **({"echo": echo} if echo else {})}, headers=AUTH)
+        r.raise_for_status()
+        return r.json()["state"]
+```
+
+Cosa fa il bridge mentre la musica suona:
+
+| Succede | Il bridge |
+|---|---|
+| Dici "Alexa" o premi il tasto | mette in pausa, ti ascolta e risponde, poi riprende dal punto in cui era |
+| L'agente avvia la musica mentre sta ancora rispondendo ("Alexa, metti i Queen") | la tiene in coda e la fa partire a risposta finita, così la risposta non viene tagliata |
+| Arriva un annuncio (D1) | pausa, annuncio, ripresa |
+| Dici "Alexa, stop" | la mette in pausa e non la riprende da sola. Il tool può chiamare `resume` |
+| Il tool chiama `pause` o `stop` (per esempio "Alexa, ferma la musica" all'agente) | pausa o stop. Dopo la risposta non riprende |
+| Il brano finisce | stato `idle`; con `EVENT_WEBHOOK` arriva `{"type": "music", "event": "finished", "title": "…"}` |
+| La sorgente non si apre (URL scaduto, 403) | stato `idle`; nel webhook `"event": "error"` con il messaggio di ffmpeg |
+
+- **Coda e playlist:** le gestisce il tool. Al webhook `finished` (o controllando `GET /api/music` ogni tanto), il tool
+  manda il `play` del brano successivo. Il webhook è quello di `EVENT_WEBHOOK` in `echo-bridge.env`: può essere un
+  endpoint del server MCP stesso.
+- **Volume:** strumento MCP `set_volume` del bridge, oppure i tasti dell'Echo.
+- **URL di YouTube:** scadono dopo qualche ora e sono legati all'indirizzo IP pubblico di chi li ha ricavati. Il tool
+  e il bridge dietro lo stesso router vanno bene. Se il tool esce da un'altra connessione (VPN), ffmpeg riceve 403: in
+  quel caso il tool scarica il file e lo serve sulla rete locale via HTTP, e passa quell'URL al bridge.
+- L'Echo Dot ha un solo altoparlante: il bridge manda un MP3 stereo a 192 kbit/s, e l'Echo lo riproduce in mono.
 
 ---
 

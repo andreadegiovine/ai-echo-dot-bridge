@@ -176,6 +176,12 @@ async def phase_a():
         check(await wait_for(lambda: "paused" in read(s.echo_log), 5), "timer in pausa")
         await mcp_call(s.http_port, "cancel_timer", {"name": "pasta"})
         check(await wait_for(lambda: "timer cancelled: pasta" in read(s.echo_log), 5), "timer annullato")
+        import json as js, urllib.request
+        req = urllib.request.Request(f"http://127.0.0.1:{s.http_port}/api/timers", headers={"Content-Type": "application/json"},
+                                     data=js.dumps({"action": "start", "seconds": 2, "name": "dal tool"}).encode())
+        r = js.loads(urllib.request.urlopen(req, timeout=10).read())
+        check(r["timers"][0]["name"] == "dal tool", f"REST /api/timers: {r}")
+        check(await wait_for(lambda: "timer finished: dal tool" in read(s.echo_log), 6), "timer creato da un tool via REST: suona sull'Echo")
 
         before = os.path.getsize(s.play)
         r = await mcp_call(s.http_port, "announce", {"text": "La lavatrice ha finito."})
@@ -274,11 +280,102 @@ async def phase_d():
         shutil.rmtree(s.dir, ignore_errors=True)
 
 
+async def phase_e():
+    print("== E. musica da un URL come quello di YouTube (Opus/WebM): conversione, pausa per voce e annunci, ripresa")
+    import functools, http.server, json as js, threading, urllib.request
+    www = tempfile.mkdtemp(); seen = []
+    for name, secs in (("song.webm", 40), ("short.webm", 3)):
+        subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i", f"sine=frequency=330:duration={secs}",
+                        "-ac", "2", "-c:a", "libopus", "-b:a", "96k", os.path.join(www, name)], check=True)
+    class H(http.server.SimpleHTTPRequestHandler):
+        def __init__(self, *a, **k): super().__init__(*a, directory=www, **k)
+        def do_GET(self): seen.append(self.headers.get("X-Test")); super().do_GET()
+        def log_message(self, *a): pass
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 18310), H)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    s = Setup(16976, 18174, False)
+    hooks = []
+    async def hook(reader, writer):
+        head = await reader.readuntil(b"\r\n\r\n")
+        n = next((int(l.split(b":")[1]) for l in head.split(b"\r\n") if l.lower().startswith(b"content-length")), 0)
+        hooks.append(js.loads(await reader.readexactly(n)))
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"); await writer.drain(); writer.close()
+    hook_srv = await asyncio.start_server(hook, "127.0.0.1", 18311)
+
+    def api(body):
+        req = urllib.request.Request(f"http://127.0.0.1:{s.http_port}/api/music", data=js.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        return js.loads(urllib.request.urlopen(req, timeout=10).read())
+    blog = lambda: read(s.bridge_log)
+    elog = lambda: read(s.echo_log)
+    try:
+        s.start_fakes(); s.start_echo(); await asyncio.sleep(1.5)
+        s.start_bridge(FOLLOWUP="0", EVENT_WEBHOOK="http://127.0.0.1:18311/hook")
+        check(await wait_for(lambda: "collegato a" in blog()), "collegato")
+        st = api({"url": "http://127.0.0.1:18310/song.webm", "title": "Canzone", "headers": {"X-Test": "yt"}})
+        check(st.get("state") == "playing", f"play: {st}")
+        check(await wait_for(lambda: "media: MP3 44100 Hz x2" in elog(), 10), "l'Echo suona l'MP3 convertito dal bridge (sorgente Opus)")
+        check(seen and seen[0] == "yt", f"gli headers della sorgente arrivano a ffmpeg: {seen}")
+
+        await asyncio.sleep(4); s.wake()
+        check(await wait_for(lambda: "musica interrotta per una richiesta" in blog(), 5), "\"Alexa\" mette in pausa la musica")
+        check(await wait_for(lambda: "fine risposta" in blog(), 25), "la risposta arriva")
+        check(await wait_for(lambda: blog().count('musica "Canzone" da ') >= 1, 15), "a risposta finita la musica riprende")
+        import re
+        pos = [int(x) for x in re.findall(r'musica "Canzone" da (\d+) s', blog())]
+        check(pos and pos[0] >= 3, f"riprende dal punto in cui era: {pos} s")
+
+        await asyncio.sleep(2)
+        n = blog().count('musica "Canzone" da ')
+        r = urllib.request.urlopen(urllib.request.Request(f"http://127.0.0.1:{s.http_port}/api/announce",
+            data=js.dumps({"text": "La lavatrice ha finito."}).encode(), headers={"Content-Type": "application/json"}), timeout=60)
+        check(js.loads(r.read()).get("played") is True, "annuncio durante la musica: riprodotto (non scartato)")
+        check(await wait_for(lambda: blog().count('musica "Canzone" da ') > n, 10), "dopo l'annuncio la musica riprende")
+
+        await asyncio.sleep(2); s.wake(); await asyncio.sleep(0.5)
+        s.procs["echo"].send_signal(signal.SIGHUP)                       # "Alexa, stop"
+        check(await wait_for(lambda: '"stop": musica in pausa' in blog(), 8), "\"Alexa, stop\": musica in pausa")
+        n = blog().count('musica "Canzone" da '); await asyncio.sleep(5)
+        check(blog().count('musica "Canzone" da ') == n and api({"action": "status"})["state"] == "paused",
+              "dopo \"stop\" non riprende da sola")
+        st = api({"action": "resume"})
+        check(st["state"] == "playing" and await wait_for(lambda: blog().count('musica "Canzone" da ') > n, 5), f"resume dal tool: {st}")
+        await asyncio.sleep(2)
+        st = api({"action": "pause"}); await asyncio.sleep(4)
+        check(st["state"] == "paused" and api({"action": "status"})["state"] == "paused", "pause dal tool: resta in pausa")
+        st = api({"action": "stop"})
+        check(st["state"] == "idle", f"stop dal tool: {st}")
+
+        s.wake(); await asyncio.sleep(1.0)                               # l'agente avvia la musica mentre risponde
+        st = api({"url": "http://127.0.0.1:18310/short.webm", "title": "Breve"})
+        check(st["state"] == "interrupted" and "in coda, parte dopo la risposta" in blog(), f"play durante una richiesta: in coda ({st['state']})")
+        check(await wait_for(lambda: 'musica "Breve"' in blog(), 30), "parte a risposta finita")
+        check(await wait_for(lambda: "brano finito: Breve" in blog(), 20), "fine del brano riconosciuta")
+        check(api({"action": "status"})["state"] == "idle", "dopo la fine: nessuna musica")
+        check(await wait_for(lambda: any(h.get("type") == "music" and h.get("event") == "finished" and h.get("title") == "Breve"
+                                         for h in hooks), 5), "webhook: evento \"finished\" per il tool musica")
+        api({"url": "http://127.0.0.1:18310/manca.webm", "title": "Sparito"})
+        check(await wait_for(lambda: "musica non riproducibile" in blog(), 15), "sorgente che non si apre: errore nel log")
+        check(await wait_for(lambda: any(h.get("event") == "error" and h.get("title") == "Sparito" for h in hooks), 5),
+              "webhook: evento \"error\"")
+        check(api({"action": "status"})["state"] == "idle", "dopo l'errore: nessuna musica")
+    finally:
+        s.close(); httpd.shutdown(); hook_srv.close()
+        if FAILED:
+            print("--- bridge.log ---\n" + read(s.bridge_log)[-4000:]); print("--- echo ---\n" + read(s.echo_log)[-3000:])
+        shutil.rmtree(s.dir, ignore_errors=True); shutil.rmtree(www, ignore_errors=True)
+
+
 async def main():
+    if os.environ.get("ONLY"):
+        await globals()["phase_" + os.environ["ONLY"]]()
+        print("TUTTI I TEST ESPHOME OK" if not FAILED else f"FALLITI: {len(FAILED)}")
+        sys.exit(1 if FAILED else 0)
     a_peak = await phase_a()
     await phase_b(a_peak)
     await phase_c()
     await phase_d()
+    await phase_e()
     print("TUTTI I TEST ESPHOME OK" if not FAILED else f"FALLITI: {len(FAILED)}")
     sys.exit(1 if FAILED else 0)
 

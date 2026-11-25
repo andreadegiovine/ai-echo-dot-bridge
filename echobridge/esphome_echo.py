@@ -23,6 +23,7 @@ import aioesphomeapi as api
 from aioesphomeapi import VoiceAssistantEventType as Ev
 
 from . import audio, config as c, speech
+from .music import Music
 from .timers import Timers
 
 log = logging.getLogger("echo-bridge")
@@ -92,6 +93,13 @@ class EsphomeEcho:
         self.followup = None                        # (domanda, risposta, quando) se l'ultima risposta era una domanda
         self.last_active = 0.0
         self.keys = KeyStore()
+        self.music = Music(self)
+        self._abort = False
+        self._announcing = 0
+
+    def busy(self):
+        """Una richiesta vocale o un annuncio in corso."""
+        return bool(self._announcing) or bool(self.run_task and not self.run_task.done())
 
     # ------------------------------------------------------------ collegamento
 
@@ -180,6 +188,7 @@ class EsphomeEcho:
             log.warning("%s: collegamento chiuso", self.label)
         finally:
             self.connected = False
+            self.music._halt()
             self.cli = None
             try:
                 await cli.disconnect()
@@ -192,6 +201,8 @@ class EsphomeEcho:
         self.states[st.key] = st
         self.state_seq[st.key] = self.state_seq.get(st.key, 0) + 1
         ent = self.entities.get(st.key)
+        if isinstance(st, api.MediaPlayerEntityState):
+            self.music.on_media_state(st.state)
         if isinstance(st, api.model.Event) and ent is not None:
             log.info("%s: evento %s: %s", self.name, ent.object_id, st.event_type)
             self.hub.webhook({"echo": self.name, "type": "event", "entity": ent.object_id, "event": st.event_type})
@@ -260,15 +271,23 @@ class EsphomeEcho:
             return None
         if self.run_task and not self.run_task.done():
             self.run_task.cancel()
+        self.music.on_run_start()
+        self._abort = False
         self.listener = speech.Listener()
         self.last_active = time.monotonic()
         self.hub.last_echo = self
         log.info("%s: richiesta (%s)", self.name, wake_word_phrase or "tasto o domanda di seguito")
         self.run_task = asyncio.get_running_loop().create_task(self._run(self.listener))
-        return 0                                                  # 0 = audio sulla connessione API
+        self.run_task.add_done_callback(self._run_done)
+        return 0
+
+    def _run_done(self, task):
+        if task is self.run_task:                                 # non sostituita da una richiesta più nuova
+            self.music.on_run_end(aborted=self._abort)                                                  # 0 = audio sulla connessione API
 
     async def _va_stop(self, abort):
         if abort:
+            self._abort = True
             if self.run_task and not self.run_task.done():
                 log.info("%s: richiesta annullata dall'Echo", self.name)
                 self.run_task.cancel()
@@ -404,14 +423,21 @@ class EsphomeEcho:
         """Dice un testo sull'Echo. listen=True: poi ascolta la risposta (start_conversation), che va all'agente."""
         if not self.cli:
             raise RuntimeError(f"{self.name} non è collegato")
-        stream = audio.AudioStream()
-        feeder = asyncio.get_running_loop().create_task(self._feed_text(stream, text))
+        self._announcing += 1
         try:
-            res = await self.cli.send_voice_assistant_announcement_await_response(
-                self.url(stream.path), c.ANNOUNCE_TIMEOUT, text, start_conversation=listen)
+            await self.music.before_announce()                    # l'Echo suona un URL alla volta: pausa
+            stream = audio.AudioStream()
+            feeder = asyncio.get_running_loop().create_task(self._feed_text(stream, text))
+            try:
+                res = await self.cli.send_voice_assistant_announcement_await_response(
+                    self.url(stream.path), c.ANNOUNCE_TIMEOUT, text, start_conversation=listen)
+            finally:
+                await feeder
+            log.info("%s: annuncio %s: %s", self.name, "riprodotto" if res.success else "non riprodotto", text)
+            return res.success
         finally:
-            await feeder
-        return res.success
+            self._announcing -= 1
+            self.music.after_announce()
 
     async def _feed_text(self, stream, text):
         try:
@@ -432,12 +458,23 @@ class EsphomeEcho:
     def set_volume(self, level: float):
         self.cli.media_player_command(self.media_player().key, volume=max(0.0, min(1.0, level)))
 
-    def media(self, command=None, url=None):
-        mp = self.media_player().key
+    def media(self, command=None, url=None, title="", headers=None, seek=0.0, live=False):
+        """url: musica gestita dal bridge (vedi music.py). command: pause/resume(play)/stop della musica, oppure
+        mute, unmute, volume_up, volume_down del media player."""
         if url:
-            self.cli.media_player_command(mp, media_url=url, announcement=False)
-        if command:
-            self.cli.media_player_command(mp, command=api.MediaPlayerCommand[command.upper()])
+            return self.music.play(url, title, headers, seek, live)
+        cmd = (command or "").lower()
+        if cmd == "pause":
+            return self.music.pause()
+        if cmd in ("play", "resume"):
+            return self.music.resume()
+        if cmd == "stop":
+            self.music.stop()
+            self.cli.media_player_command(self.media_player().key, command=api.MediaPlayerCommand.STOP)
+            return self.music.status()
+        if cmd:
+            self.cli.media_player_command(self.media_player().key, command=api.MediaPlayerCommand[cmd.upper()])
+        return self.music.status()
 
     def describe(self, entities=False):
         d = {"name": self.name, "node": self.node, "protocol": self.proto, "address": self.label,
@@ -446,6 +483,7 @@ class EsphomeEcho:
         if mp is not None:
             d["volume"] = round(mp.volume, 2)
             d["media_state"] = mp.state.name if hasattr(mp.state, "name") else mp.state
+        d["music"] = self.music.status()
         if entities:
             d["entities"] = []
             for e in sorted(self.entities.values(), key=lambda e: e.object_id):

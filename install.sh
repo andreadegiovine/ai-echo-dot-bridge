@@ -11,7 +11,7 @@ APP=/opt/echo-bridge
 
 echo "==> Pacchetti di sistema"
 apt-get update
-apt-get install -y python3 python3-venv python3-dev build-essential ca-certificates curl netcat-openbsd
+apt-get install -y python3 python3-venv python3-dev build-essential ca-certificates curl netcat-openbsd ffmpeg
 
 echo "==> Utente di servizio"
 id echobridge >/dev/null 2>&1 || useradd --system --home-dir $APP --shell /usr/sbin/nologin echobridge
